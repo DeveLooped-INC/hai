@@ -1,0 +1,43 @@
+# MCP Server Configuration for HAI-Net
+# This file defines available MCP servers that can be connected to
+
+[servers.hainet-files]
+name = "HAI-Net Files"
+description = "Local HAI-Net file server with content-addressed storage"
+command = "cargo"
+args = ["run", "--package", "hainet-files", "--release"]
+enabled = true
+working_dir = "/home/tom/hai"
+# Environment variables
+env = { HAINET_FILES_BASE_PATH = "/home/tom/hai" }
+
+[servers.hainet-web]
+name = "HAI-Net Web"
+description = "Web search, URL fetching, and documentation search for research tasks"
+command = "cargo"
+args = ["run", "--package", "hainet-web", "--release"]
+enabled = true
+working_dir = "/home/tom/hai"
+# Environment variables
+env = { RUST_LOG = "info" }
+
+[servers.hainet-mcp]
+name = "HAI-Net MCP"
+description = "Core HAI-Net MCP server"
+command = "cargo"
+args = ["run", "--package", "hainet-mcp-server", "--release"]
+enabled = true
+
+[servers.hainet-dev]
+name = "HAI-Net Dev"
+description = "Development tools for HAI-Net"
+command = "cargo"
+args = ["run", "--package", "hainet-dev", "--release"]
+enabled = true
+
+[servers.hainet-system]
+name = "HAI-Net System"
+description = "System management and monitoring for HAI-Net"
+command = "cargo"
+args = ["run", "--package", "hainet-system", "--release"]
+enabled = true

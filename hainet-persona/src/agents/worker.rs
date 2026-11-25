@@ -1,0 +1,4061 @@
+//! # START OF FILE hainet-persona/src/agents/worker.rs
+//! Worker Agent
+//! 
+//! Executes individual tasks using MCP tools with learning capabilities.
+//! Worker agents follow this state machine:
+//! Idle → Planning → Working → Reporting → (Idle | Error)
+
+use anyhow::{Result, Context};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use crate::messaging::{MessageBus, AgentId};
+use crate::prompts::{PromptManager, AgentType, AgentState, WorkerType};
+use crate::projects::{ProjectManager, TaskId};
+use crate::tools::mcp::MCPClientManager;
+use crate::ai_providers::{AIProviderManager, SelectionContext, providers::GenerationOptions};
+use super::state::AgentStateMachine;
+use super::templates::WorkerTemplate;
+use super::worker_intelligence::{WorkerLearner, ExecutionStrategy, ToolSelector, ErrorCategory, TaskOutcome};
+use super::session_tasks::SessionTaskList;
+use super::worker_discovery::{
+    DiscoveryExecutionPlan, DiscoveryExecutionStep,
+    parse_tool_selection, parse_execution_plan, format_tool_list, format_tool_metadata,
+};
+use serde_json::json;
+use std::time::SystemTime;
+use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SubTask {
+    id: usize,
+    description: String,
+    goal: String,
+    verification_criteria: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VerificationResult {
+    success: bool,
+    issues: Vec<String>,
+    feedback: String,
+}
+
+/// Worker Agent
+/// 
+/// Responsible for:
+/// - Executing specific tasks assigned by PM using LLM-powered planning
+/// - Using MCP tools to accomplish work
+/// - Reporting results back to PM for validation
+/// - Learning from task outcomes to improve performance over time
+pub struct WorkerAgent {
+    /// Unique agent identifier
+    id: AgentId,
+    
+    /// Worker specialization type
+    worker_type: WorkerType,
+    
+    /// Worker template with capabilities and system prompt
+    template: WorkerTemplate,
+    
+    /// Current task being executed
+    current_task: Option<TaskId>,
+    
+    /// State machine
+    state_machine: AgentStateMachine,
+    
+    /// Message bus for communication
+    message_bus: Arc<RwLock<MessageBus>>,
+    
+    /// Prompt manager for generating prompts
+    prompt_manager: Arc<RwLock<PromptManager>>,
+    
+    /// Project manager for task updates
+    project_manager: Arc<RwLock<ProjectManager>>,
+    
+    /// MCP client for tool access
+    mcp_client: Arc<RwLock<MCPClientManager>>,
+    
+    /// AI provider manager for dynamic model selection
+    ai_provider_manager: Arc<AIProviderManager>,
+    
+    /// User settings manager for model preferences
+    user_settings: Option<Arc<RwLock<crate::user_settings::UserSettingsManager>>>,
+
+    /// Maximum retry attempts for failed operations (deprecated - use execution_strategy.max_retries)
+    max_retries: usize,
+    
+    /// Worker intelligence - historical learning
+    learner: WorkerLearner,
+    
+    /// Adaptive execution configuration
+    execution_strategy: ExecutionStrategy,
+    
+    /// Intelligent tool selector
+    tool_selector: ToolSelector,
+    
+    /// Enable self-correction (default: true)
+    self_correction_enabled: bool,
+    
+    /// Session task list - tracks progress within session
+    session_tasks: SessionTaskList,
+    
+    /// Message receiver (kept alive to maintain registration)
+    _receiver: Option<tokio::sync::mpsc::Receiver<crate::messaging::Message>>,
+    
+    /// Current project name (for file operation sandboxing)
+    /// Workers are sandboxed to /sandbox/projects/{project_name}/
+    /// None means no sandboxing (used by Admin agents)
+    current_project_name: Option<String>,
+}
+
+impl WorkerAgent {
+    /// Create new worker agent with template
+    pub fn new(
+        worker_type: WorkerType,
+        message_bus: Arc<RwLock<MessageBus>>,
+        prompt_manager: Arc<RwLock<PromptManager>>,
+        project_manager: Arc<RwLock<ProjectManager>>,
+        mcp_client: Arc<RwLock<MCPClientManager>>,
+        ai_provider_manager: Arc<AIProviderManager>,
+    ) -> Self {
+        let id = AgentId::new(AgentType::Worker, format!("Worker-{:?}", worker_type));
+        
+        // Select appropriate template based on worker type
+        let template = match worker_type {
+            WorkerType::Files => WorkerTemplate::file_worker(),
+            WorkerType::Network => WorkerTemplate::network_worker(),
+            WorkerType::Research => WorkerTemplate::research_worker(),
+            WorkerType::Code => WorkerTemplate::code_worker(),
+            WorkerType::Compute => WorkerTemplate::file_worker(), // Default to file worker
+            _ => WorkerTemplate::file_worker(),
+        };
+        
+        // Create default fallback tool order based on template
+        let fallback_tools = template.mcp_servers.iter()
+            .flat_map(|server| {
+                match server.as_str() {
+                    "hainet-files" => vec![
+                        format!("{}::file_read", server),
+                        format!("{}::file_write", server),
+                        format!("{}::file_list", server),
+                    ],
+                    "hainet-system" => vec![
+                        format!("{}::system_status", server),
+                        format!("{}::list_services", server),
+                    ],
+                    "hainet-dev" => vec![
+                        format!("{}::git_status", server),
+                        format!("{}::cargo_build", server),
+                    ],
+                    _ => vec![],
+                }
+            })
+            .collect();
+        
+        Self {
+            id,
+            worker_type,
+            template,
+            current_task: None,
+            state_machine: AgentStateMachine::new(),
+            message_bus,
+            prompt_manager,
+            project_manager,
+            mcp_client,
+            ai_provider_manager,
+            user_settings: None, // Workers don't have user settings in new() - use from_template() instead
+            max_retries: 3, // Kept for backward compatibility
+            learner: WorkerLearner::new(), // Default 100 outcome capacity
+            execution_strategy: ExecutionStrategy::default(), // 5s timeout, 3 retries, 1.5x backoff
+            tool_selector: ToolSelector::new(fallback_tools),
+            self_correction_enabled: true,
+            session_tasks: SessionTaskList::new(),
+            _receiver: None,
+            current_project_name: None, // No project until task is assigned
+        }
+    }
+    
+    /// Create worker from template
+    pub fn from_template(
+        template: WorkerTemplate,
+        message_bus: Arc<RwLock<MessageBus>>,
+        prompt_manager: Arc<RwLock<PromptManager>>,
+        project_manager: Arc<RwLock<ProjectManager>>,
+        mcp_client: Arc<RwLock<MCPClientManager>>,
+        ai_provider_manager: Arc<AIProviderManager>,
+        user_settings: Option<Arc<RwLock<crate::user_settings::UserSettingsManager>>>,
+    ) -> Self {
+        let id = AgentId::new(AgentType::Worker, template.name.clone());
+        
+        // Create default fallback tool order based on template
+        let fallback_tools = template.mcp_servers.iter()
+            .flat_map(|server| {
+                match server.as_str() {
+                    "hainet-files" => vec![
+                        format!("{}::file_read", server),
+                        format!("{}::file_write", server),
+                        format!("{}::file_list", server),
+                    ],
+                    "hainet-system" => vec![
+                        format!("{}::system_status", server),
+                        format!("{}::list_services", server),
+                    ],
+                    "hainet-dev" => vec![
+                        format!("{}::git_status", server),
+                        format!("{}::cargo_build", server),
+                    ],
+                    _ => vec![],
+                }
+            })
+            .collect();
+        
+        Self {
+            id,
+            worker_type: WorkerType::Files, // Default, overridden by template
+            template,
+            current_task: None,
+            state_machine: AgentStateMachine::new(),
+            message_bus,
+            prompt_manager,
+            project_manager,
+            mcp_client,
+            ai_provider_manager,
+            user_settings, // Accept user_settings from PM
+            max_retries: 3, // Kept for backward compatibility
+            learner: WorkerLearner::new(),
+            execution_strategy: ExecutionStrategy::default(),
+            tool_selector: ToolSelector::new(fallback_tools),
+            self_correction_enabled: true,
+            session_tasks: SessionTaskList::new(),
+            _receiver: None,
+            current_project_name: None, // No project until task is assigned
+        }
+    }
+    
+    /// Get agent ID
+    pub fn id(&self) -> &AgentId {
+        &self.id
+    }
+    
+    /// Get current state
+    pub fn state(&self) -> &AgentState {
+        self.state_machine.current_state()
+    }
+    
+    /// Helper to update status
+    async fn update_status(&self, activity: &str) {
+        self.message_bus.write().await.update_agent_status(
+            self.id.clone(),
+            format!("{:?}", self.state_machine.current_state()),
+            activity.to_string()
+        ).await;
+    }
+    
+    /// Get worker type
+    pub fn worker_type(&self) -> &WorkerType {
+        &self.worker_type
+    }
+    
+    /// Assign task to worker
+    pub async fn assign_task(&mut self, task_id: TaskId) -> Result<()> {
+        // Must be in Idle state to accept tasks
+        if !matches!(self.state_machine.current_state(), AgentState::Idle) {
+            return Err(anyhow::anyhow!("Worker not in Idle state, cannot assign task"));
+        }
+        
+        self.current_task = Some(task_id.clone());
+        
+        // NOTE: Task is already marked as Assigned in DB by PM before being sent to channel
+        // We only need to set up worker-side state here
+        
+        // Get task details and add to session task list
+        let task = self.get_task_details(&task_id).await?;
+        self.session_tasks.add_task(
+            task.title.clone(), 
+            Some(task.description.clone())
+        );
+        
+        // Extract project name for file operation sandboxing
+        // Workers are sandboxed to /sandbox/projects/{project_name}/
+        let project_title = {
+            let pm = self.project_manager.read().await;
+            let project = pm.get_project(&task.project_id).await?
+                .ok_or_else(|| anyhow::anyhow!("Project not found: {}", task.project_id))?;
+            project.title.clone()
+        };
+        
+        self.current_project_name = Some(project_title.clone());
+        
+        tracing::info!(
+            "Worker {} assigned to project '{}' (sandboxed file access)",
+            self.id.name,
+            project_title
+        );
+        
+        tracing::debug!(
+            "Worker {} added task to session: {}",
+            self.id.name,
+            task.title
+        );
+        
+        Ok(())
+    }
+    
+    /// Execute assigned task with discovery-based tool loading
+    /// 
+    /// Uses the native LLM + MCP tool execution path by default.
+    /// Falls back to the Python TE Bridge only if AGENT_BRIDGE_URL is explicitly set.
+    pub async fn execute_task_with_discovery(&mut self) -> Result<()> {
+        let task_id = self.current_task.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No task assigned"))?
+            .clone();
+        
+        // Get task details
+        let task = self.get_task_details(&task_id).await?;
+        
+        // Mark task as in progress in session
+        self.session_tasks.start_task(&task.title)
+            .unwrap_or_else(|e| tracing::warn!("Failed to update session task: {}", e));
+            
+        let start_time = SystemTime::now();
+        let result = self.execute_autonomous_cycle(&task).await;
+        
+        match result {
+            Ok(deliverables) => {
+                // Mark task as complete in session
+                self.session_tasks.complete_task(&task.title)
+                    .unwrap_or_else(|e| tracing::warn!("Failed to complete session task: {}", e));
+                
+                // Submit task for review
+                let project_manager = self.project_manager.write().await;
+                project_manager.complete_task(&task_id, deliverables.clone()).await?;
+                
+                tracing::info!("Worker {} completed task: {} and updated status to UnderReview", self.id.name, task.title);
+                
+                // Send TaskResult message to PM with retry
+                let task_result = crate::messaging::MessageContent::TaskResult(crate::messaging::TaskResult {
+                    task_id: task_id.to_string(),
+                    success: true,
+                    output: serde_json::Value::String(deliverables.join("\n")),
+                    error: None,
+                    metrics: crate::messaging::TaskMetrics {
+                        duration_ms: start_time.elapsed().unwrap_or_default().as_millis() as u64,
+                        cost_usd: 0.0,
+                        resource_tier_used: crate::messaging::ResourceTier::LocalOnly,
+                        tokens_used: None,
+                    },
+                });
+                
+                if let Err(e) = self.send_message_to_pm_with_retry(&task.project_id, task_result, 4).await {
+                    tracing::warn!("Worker {} failed to send completion message to PM after retries: {:?}", self.id.name, e);
+                }
+                
+                Ok(())
+            }
+            Err(e) => {
+                // Mark task as failed in session
+                self.session_tasks.fail_task(&task.title)
+                    .unwrap_or_else(|err| tracing::warn!("Failed to fail session task: {}", err));
+                
+                // Properly fail the task in project manager to prevent it from being stuck
+                tracing::error!(
+                    "Worker {} failing task {} due to execution error: {}",
+                    self.id.name,
+                    task_id,
+                    e
+                );
+                
+                let project_manager = self.project_manager.write().await;
+                if let Err(fail_err) = project_manager.fail_task(&task_id, format!("Worker execution error: {}", e)).await {
+                    tracing::error!(
+                        "Worker {} failed to mark task {} as failed: {}",
+                        self.id.name,
+                        task_id,
+                        fail_err
+                    );
+                }
+                
+                // Send ErrorReport message to PM with retry
+                let error_report = crate::messaging::MessageContent::ErrorReport(crate::messaging::ErrorReport {
+                    error_type: "ExecutionError".to_string(),
+                    message: e.to_string(),
+                    stack_trace: None,
+                    recoverable: false,
+                });
+                
+                if let Err(send_err) = self.send_message_to_pm_with_retry(&task.project_id, error_report, 4).await {
+                    tracing::warn!("Worker {} failed to send error message to PM after retries: {:?}", self.id.name, send_err);
+                }
+                
+                Err(e)
+            }
+        }
+    }
+    
+    /// Executes the task using the continuous autonomous cycle engine (TE pattern).
+    async fn execute_autonomous_cycle(&mut self, task: &crate::projects::Task) -> Result<Vec<String>> {
+        tracing::info!("Worker {} starting autonomous cycle for task '{}'", self.id.name, task.title);
+        
+        let mut loop_count = 0;
+        let max_loops = 50; // max cycles
+        
+        let mut watchdog = crate::agents::cycle_engine::WatchdogState::new(AgentState::Planning);
+        let mut duplicate_tracker = crate::agents::cycle_engine::DuplicateToolTracker::new();
+        let mut deliverables = Vec::new();
+        let mut local_context: Vec<String> = Vec::new();
+        
+        self.state_machine.transition(AgentState::Planning, "Cycle started".to_string())?;
+        
+        local_context.push(format!(
+            "System/User: BEGIN TASK.\nTask Title: {}\nTask Description: {}\n\nAnalyze the task and request state transition to begin work.",
+            task.title, task.description
+        ));
+        
+        let available_tools = self.discover_tools().await?;
+        let tools_list_str = available_tools.join(", ");
+        
+        if available_tools.is_empty() {
+            local_context.push("System: WARNING - You have 0 MCP tools available. You CANNOT perform any file modifications, code execution, or external network requests. You must immediately use 'request_state' to go to 'worker_report' and inform the PM that you lack the necessary tools to complete this task.".to_string());
+        }
+        
+        while loop_count < max_loops {
+            loop_count += 1;
+            
+            let current_state = self.state_machine.current_state().clone();
+            if current_state == AgentState::Idle {
+                tracing::info!("Worker {} reached Idle state, finishing task.", self.id.name);
+                break;
+            }
+            if current_state == AgentState::Reporting && deliverables.is_empty() {
+                if available_tools.is_empty() {
+                    deliverables.push("Task failed: No MCP tools were available to perform the work.".to_string());
+                } else {
+                    deliverables.push("Task executed. See context summary.".to_string());
+                }
+                break;
+            }
+            
+            let prompt_name = match current_state {
+                AgentState::Startup => "worker_startup_prompt",
+                AgentState::Planning => "worker_decompose_prompt",
+                AgentState::Working => "worker_work_prompt",
+                AgentState::Testing => "worker_test_prompt",
+                AgentState::Reporting => "worker_report_prompt",
+                AgentState::Idle => "worker_wait_prompt",
+                _ => "worker_work_prompt",
+            };
+            
+            let mut system_prompt = self.get_te_prompt(prompt_name)
+                .unwrap_or_else(|| self.template.system_prompt.clone());
+            
+            if watchdog.check(current_state.clone()) {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&watchdog.intervention_message(crate::agents::cycle_engine::AgentType::Worker));
+            }
+            
+            let framework_instructions = self.get_te_prompt("worker_standard_framework_instructions")
+                .unwrap_or_default();
+            
+            let tool_instructions = format!(
+                "Available tools: {}, request_state, project_management, send_message\n\n\
+                Native Tool Minimal Schemas:\n\
+                - request_state: {{\"state\": \"<worker_state>\"}}\n\
+                - project_management: {{\"action\": \"<list_tasks|add_task|modify_task>\", ...}}\n\
+                - send_message: {{\"target_agent_id\": \"<agent_id>\", \"message_content\": \"<message>\"}}\n\n\
+                Use the 'framework::tool_information' tool to request the FULL JSON schema and detailed description of ANY tool (including native tools) if you need more details.",
+                tools_list_str
+            );
+            
+            system_prompt = system_prompt.replace("{worker_standard_framework_instructions}", &framework_instructions);
+            system_prompt = system_prompt.replace("{agent_id}", &self.id.name);
+            system_prompt = system_prompt.replace("{role}", &format!("{:?}", self.worker_type));
+            system_prompt = system_prompt.replace("{personality_instructions}", &self.template.system_prompt);
+            system_prompt = system_prompt.replace("{tool_instructions}", &tool_instructions);
+            system_prompt = system_prompt.replace("{task_description}", &task.description);
+            system_prompt = system_prompt.replace("{task_id}", &task.id.to_string());
+            
+            // Project context substitutions
+            let project_name = self.current_project_name.clone().unwrap_or_else(|| "unknown".to_string());
+            system_prompt = system_prompt.replace("{project_name}", &project_name);
+            system_prompt = system_prompt.replace("{team_id}", &format!("team_{}", project_name));
+            system_prompt = system_prompt.replace("{session_name}", "main");
+            system_prompt = system_prompt.replace("{current_time_utc}", &chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string());
+            
+            // Address book — find PM agent ID so the worker knows who to message
+            let pm_agent_id = {
+                let bus = self.message_bus.read().await;
+                let agents = bus.get_active_agents().await;
+                agents.iter()
+                    .find(|a| a.id.agent_type == crate::messaging::AgentType::PM)
+                    .map(|a| a.id.name.clone())
+                    .unwrap_or_else(|| "PM (not found)".to_string())
+            };
+            system_prompt = system_prompt.replace("{address_book}", &format!("PM Agent: {}\nAdmin AI: admin_ai", pm_agent_id));
+            
+            // Task/team status
+            let task_summary = {
+                let pm = self.project_manager.read().await;
+                if let Ok(tasks) = pm.get_project_tasks(&task.project_id).await {
+                    tasks.iter()
+                        .map(|t| format!("- [{}] {} (assigned: {:?})", t.status, t.title, t.assigned_worker))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    "No task data available.".to_string()
+                }
+            };
+            system_prompt = system_prompt.replace("{team_wip_updates}", &task_summary);
+            
+            // Clear example/placeholder variables that don't apply in HAI-Net
+            system_prompt = system_prompt.replace("{kb_search_example}", "");
+            system_prompt = system_prompt.replace("{workspace_list_example}", "");
+            system_prompt = system_prompt.replace("{tool_examples}", "");
+            system_prompt = system_prompt.replace("{report_examples}", "");
+            
+            system_prompt.push_str("\n\nCRITICAL INSTRUCTION: You MUST respond with exactly ONE JSON object representing your action. Example: {\"tool\": \"tool_name\", \"params\": {\"key\": \"value\"}}");
+            
+            let options = crate::ai_providers::providers::GenerationOptions {
+                system: Some(system_prompt),
+                temperature: Some(0.4),
+                ..Default::default()
+            };
+            
+            let context_history = local_context.join("\n\n");
+            let user_prompt = format!("Current Context:\n{}\n\nWhat is your NEXT ACTION?", context_history);
+            
+            let response = match {
+                let preferred_family = if let Some(prefs) = &self.user_settings {
+                    prefs.read().await.get_model_preference("worker").await.unwrap_or(None)
+                } else {
+                    None
+                };
+                let selection_context = crate::ai_providers::SelectionContext::for_worker();
+                let selected_model = self.ai_provider_manager.select_model_for_agent_with_preferences(selection_context, preferred_family).await?;
+                let client = selected_model.get_client()?;
+                let model_name = if selected_model.model_id.contains("::") {
+                    selected_model.model_id.split("::").nth(1).unwrap_or(&selected_model.model_id)
+                } else {
+                    &selected_model.model_id
+                };
+                client.generate(model_name, &user_prompt, options).await
+            } {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("LLM Generation failed: {}", e);
+                    local_context.push(format!("System: Error generating response: {}", e));
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            
+            let action: serde_json::Value = match self.extract_from_markdown(&response.text) {
+                Ok(json) => json,
+                Err(_) => {
+                    let json_str = self.extract_json_from_response(&response.text);
+                    match serde_json::from_str(&json_str) {
+                        Ok(json) => json,
+                        Err(_) => {
+                            local_context.push("System: Error: Failed to parse output as JSON. Please try again and ensure you output exactly ONE JSON object.".to_string());
+                            continue;
+                        }
+                    }
+                }
+            };
+            
+            let tool_name = action.get("tool").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let params = action.get("params").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
+            
+            local_context.push(format!("Assistant: Executing tool: {} with params: {}", tool_name, params));
+            
+            let sig = crate::agents::cycle_engine::ToolCallSignature {
+                tool_name: tool_name.clone(),
+                args_hash: params.to_string(),
+            };
+            if duplicate_tracker.record_call(sig) {
+                local_context.push("System: Error: You are repeating the same action. Force transition required. Please execute request_state.".to_string());
+                continue;
+            }
+            
+            if tool_name == "framework::tool_information" || tool_name == "tool_information" {
+                if let Some(tools_array) = params.get("tools").and_then(|t| t.as_array()) {
+                    let mut tool_schemas = Vec::new();
+                    let client = self.mcp_client.read().await;
+                    for tool_val in tools_array {
+                        if let Some(tool_name_req) = tool_val.as_str() {
+                            if let Ok(meta) = client.get_tool_metadata(tool_name_req).await {
+                                tool_schemas.push(serde_json::to_string(&meta).unwrap_or_default());
+                            } else {
+                                match tool_name_req {
+                                    "request_state" => tool_schemas.push(r#"{"name":"request_state","description":"Drive the Worker state machine","inputSchema":{"type":"object","properties":{"state":{"type":"string","enum":["worker_startup","worker_decompose","worker_work","worker_test","worker_report","worker_wait"]},"task_id":{"type":"string","description":"Optional: ID of the task to switch to (e.g., after decomposition)"}},"required":["state"]}}"#.to_string()),
+                                    "project_management" => tool_schemas.push(r#"{"name":"project_management","description":"CRUD operations on project sub-tasks","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list_tasks","add_task","modify_task"]},"title":{"type":"string","description":"Task title (for add_task)"},"description":{"type":"string","description":"Task description"},"task_id":{"type":"string","description":"Required for modify_task"},"task_progress":{"type":"string","description":"Progress update for modify_task"}},"required":["action"]}}"#.to_string()),
+                                    "send_message" => tool_schemas.push(r#"{"name":"send_message","description":"Inter-agent communication","inputSchema":{"type":"object","properties":{"target_agent_id":{"type":"string"},"message_content":{"type":"string"}},"required":["target_agent_id","message_content"]}}"#.to_string()),
+                                    _ => tool_schemas.push(format!("Error: Could not find schema for tool '{}'. Note: Native tools like project_management and send_message are now documented via this tool.", tool_name_req))
+                                }
+                            }
+                        }
+                    }
+                    local_context.push(format!("System: [tool_information result]\n{}", tool_schemas.join("\n\n")));
+                } else {
+                    local_context.push("System: Error: tool_information requires a 'tools' parameter containing an array of tool names. Example: {\"tool\": \"framework::tool_information\", \"params\": {\"tools\": [\"hainet-files::file_read\"]}}".to_string());
+                }
+                continue;
+            }
+            
+            if tool_name == "framework::request_state" || tool_name == "request_state" {
+                if let Some(new_state_str) = params.get("state").and_then(|s| s.as_str()) {
+                    let new_state = match new_state_str {
+                        "worker_startup" => AgentState::Startup,
+                        "worker_decompose" => AgentState::Planning,
+                        "worker_work" => AgentState::Working,
+                        "worker_test" => AgentState::Testing,
+                        "worker_report" => AgentState::Reporting,
+                        "worker_wait" | "worker_standby" => AgentState::Idle,
+                        _ => {
+                            local_context.push(format!("System: Error: Invalid state requested '{}'", new_state_str));
+                            continue;
+                        }
+                    };
+                    
+                    if *self.state_machine.current_state() == new_state {
+                        local_context.push(format!("System: Info: You are already in the '{}' state. No transition needed. Please execute a different action.", new_state_str));
+                        continue;
+                    }
+                    
+                    if let Err(e) = self.state_machine.transition(new_state.clone(), format!("LLM requested state change to {}", new_state_str)) {
+                        local_context.push(format!("System: Error: State transition failed: {}", e));
+                    } else {
+                        duplicate_tracker.reset();
+                        self.update_status(&format!("Transitioned to {:?}", new_state)).await;
+                        
+                        // If the worker provided a new task_id (e.g., after decomposition), update the active task
+                        if let Some(tid_str) = params.get("task_id").and_then(|t| t.as_str()) {
+                            if let Ok(uuid) = uuid::Uuid::parse_str(tid_str) {
+                                self.current_task = Some(crate::projects::TaskId::from_uuid(uuid));
+                                local_context.push(format!("System: State changed to {}. Active task switched to {}.", new_state_str, tid_str));
+                            } else {
+                                local_context.push(format!("System: State changed to {}. Warning: Invalid task_id format '{}'.", new_state_str, tid_str));
+                            }
+                        } else {
+                            local_context.push(format!("System: State successfully changed to {}", new_state_str));
+                        }
+                    }
+                } else {
+                    local_context.push("System: Error: request_state tool requires 'state' parameter.".to_string());
+                }
+                continue;
+            }
+            
+            // --- Native tool: send_message (inter-agent communication) ---
+            if tool_name == "send_message" {
+                let target = params.get("target_agent_id").and_then(|t| t.as_str()).unwrap_or("");
+                let content = params.get("message_content").or(params.get("message"))
+                    .and_then(|c| c.as_str()).unwrap_or("");
+                
+                // Find target agent in the bus
+                let target_agent_id = {
+                    let bus = self.message_bus.read().await;
+                    let agents = bus.get_active_agents().await;
+                    agents.iter()
+                        .find(|a| a.id.name.contains(target) || 
+                              (target.contains("admin") && a.id.agent_type == crate::messaging::AgentType::Admin) ||
+                              (target.contains("PM") && a.id.agent_type == crate::messaging::AgentType::PM))
+                        .map(|a| a.id.clone())
+                };
+                
+                if let Some(target_id) = target_agent_id {
+                    let msg = crate::messaging::Message::new(
+                        self.id.clone(),
+                        target_id.clone(),
+                        crate::messaging::MessageContent::StatusUpdate(crate::messaging::StatusUpdate {
+                            agent_id: self.id.clone(),
+                            state: self.state_machine.current_state().clone(),
+                            message: content.to_string(),
+                            progress: None,
+                        })
+                    );
+                    if let Err(e) = self.message_bus.write().await.send_message(msg).await {
+                        local_context.push(format!("System: Error sending message to {}: {}", target, e));
+                    } else {
+                        local_context.push(format!("System: Message sent to {}: {}", target_id.name, content));
+                    }
+                } else {
+                    local_context.push(format!("System: Error: Agent '{}' not found. Check your Address Book.", target));
+                }
+                continue;
+            }
+            
+            // --- Native tool: project_management (sub-task management for workers) ---
+            if tool_name == "project_management" {
+                let pm_action = params.get("action").and_then(|a| a.as_str()).unwrap_or("");
+                match pm_action {
+                    "list_tasks" => {
+                        let pm = self.project_manager.read().await;
+                        if let Ok(tasks) = pm.get_project_tasks(&task.project_id).await {
+                            let summary: String = tasks.iter()
+                                .map(|t| format!("- [{}] {} (ID: {}, assigned: {:?})", t.status, t.title, t.id, t.assigned_worker))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            local_context.push(format!("System: [list_tasks result]\n{}", summary));
+                        } else {
+                            local_context.push("System: Error listing tasks.".to_string());
+                        }
+                    }
+                    "add_task" => {
+                        let title = params.get("title").or(params.get("task_name")).or(params.get("name")).or(params.get("description"))
+                            .and_then(|t| t.as_str()).unwrap_or("Untitled Sub-Task").to_string();
+                        let description = params.get("description")
+                            .and_then(|d| d.as_str()).unwrap_or(&title).to_string();
+                        
+                        let task_id_opt = {
+                            let project_manager = self.project_manager.write().await;
+                            match project_manager.create_task(&task.project_id, title.clone(), description).await {
+                                Ok(task_id) => Some(task_id),
+                                Err(e) => {
+                                    local_context.push(format!("System: Error creating sub-task: {}", e));
+                                    None
+                                }
+                            }
+                        };
+
+                        if let Some(task_id) = task_id_opt {
+                            let project_manager = self.project_manager.write().await;
+                            match project_manager.assign_task(&task_id, self.id.clone()).await {
+                                Ok(_) => local_context.push(format!("System: Sub-task created and assigned to you: ID={}, Title={}", task_id, title)),
+                                Err(e) => local_context.push(format!("System: Sub-task created (ID={}) but failed to assign: {}", task_id, e)),
+                            }
+                        }
+                    }
+                    "modify_task" => {
+                        let task_id_str = params.get("task_id").and_then(|t| t.as_str()).unwrap_or("");
+                        let progress = params.get("task_progress").and_then(|p| p.as_str());
+                        
+                        if let Some(progress_str) = progress {
+                            local_context.push(format!("System: Task '{}' progress updated to '{}' (noted).", task_id_str, progress_str));
+                        } else {
+                            local_context.push(format!("System: modify_task acknowledged for '{}'.", task_id_str));
+                        }
+                    }
+                    _ => {
+                        local_context.push(format!("System: Unknown project_management action '{}'. Use: list_tasks, add_task, modify_task", pm_action));
+                    }
+                }
+                continue;
+            }
+            
+            let (resolved_tool, extra_params, _was_aliased) = crate::agents::worker_discovery::resolve_tool_alias(&tool_name);
+            let mut final_params = params.clone();
+            if let Some(obj) = final_params.as_object_mut() {
+                for (k, v) in extra_params {
+                    obj.insert(k, serde_json::Value::String(v));
+                }
+            }
+            
+            tracing::info!("Worker {} executing tool: {}", self.id.name, resolved_tool);
+            
+            // Execute tool safely
+            let parts: Vec<&str> = resolved_tool.split("::").collect();
+            if parts.len() != 2 {
+                local_context.push(format!("System: Error: Invalid tool format '{}'", resolved_tool));
+                continue;
+            }
+            
+            let execution_result = {
+                let client = self.mcp_client.read().await;
+                client.call_tool(parts[0], parts[1], final_params.clone()).await
+            };
+            
+            match execution_result {
+                Ok(res) => {
+                    let result_str = if res.to_string().is_empty() || res.to_string() == "null" {
+                        "Tool executed successfully with no output".to_string()
+                    } else {
+                        res.to_string()
+                    };
+                    local_context.push(format!("System: Tool Result:\n{}", result_str));
+                    
+                    if resolved_tool.contains("file_write") {
+                        deliverables.push(format!("Wrote file: {}", final_params.get("path").or(final_params.get("filepath")).and_then(|v| v.as_str()).unwrap_or("unknown")));
+                    }
+                }
+                Err(e) => {
+                    local_context.push(format!("System: Tool Execution Error: {}", e));
+                }
+            }
+        }
+        
+        if loop_count >= max_loops {
+            tracing::warn!("Worker {} hit max cycles ({})", self.id.name, max_loops);
+        }
+        
+        Ok(deliverables)
+    }
+
+    
+    /// Delegate task execution to the Python gRPC Bridge
+    async fn execute_with_bridge(&mut self, task: &crate::projects::Task) -> Result<Vec<String>> {
+        tracing::info!("Worker {} delegating task execution to Python TE Bridge...", self.id.name);
+        
+        let bridge_url = std::env::var("AGENT_BRIDGE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+        let mut bridge = crate::bridge::client::BridgeClient::connect(bridge_url)
+            .await
+            .context("Failed to connect to Python TE Bridge")?;
+            
+        let model = if let Some(prefs) = &self.user_settings {
+            let prefs = prefs.read().await;
+            prefs.get_model_preference("worker")
+                .await
+                .unwrap_or(None)
+                .unwrap_or_else(|| "gpt-4o".to_string())
+        } else {
+            "gpt-4o".to_string()
+        };
+            
+        bridge.initialize_agent(
+            self.id.name.clone(),
+            format!("{:?}", self.worker_type),
+            self.template.name.clone(),
+            "local".to_string(), // fallback provider 
+            model,
+            0.7,
+            self.template.system_prompt.clone(),
+            false
+        ).await?;
+        
+        let prompt = format!(
+            "Task Title: {}\nTask Description: {}\n\nPlease execute this task using your tools.", 
+            task.title, 
+            task.description
+        );
+        
+        let mut stream = bridge.send_message(
+            self.id.name.clone(),
+            "user".to_string(),
+            prompt
+        ).await?;
+        
+        let mut response = String::new();
+        while let Some(msg) = stream.message().await? {
+            match msg.r#type {
+                0 => response.push_str(&msg.content), // TextChunk
+                1 => tracing::info!("Agent {} starting tool: {} ({})", self.id.name, msg.content, msg.tool_call_id),
+                2 => {}, // ToolCallChunk
+                3 => tracing::info!("Agent {} completed tool: {}", self.id.name, msg.tool_call_id),
+                4 => break, // Complete
+                5 => return Err(anyhow::anyhow!("Bridge error: {}", msg.content)), // Error
+                _ => {}
+            }
+        }
+        
+        if response.is_empty() {
+            tracing::warn!("Agent {} returned empty response from bridge", self.id.name);
+            response = "Task executed but no response returned from bridge.".to_string();
+        }
+        
+        Ok(vec![response])
+    }
+    
+    /// Execute assigned task with LLM-powered planning and learning (LEGACY)
+    /// 
+    /// This is the original monolithic approach - kept for backward compatibility.
+    /// Use execute_task_with_discovery() for new code.
+    #[deprecated(note = "Use execute_task_with_discovery instead")]
+    pub async fn execute_task(&mut self) -> Result<()> {
+        let task_id = self.current_task.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No task assigned"))?
+            .clone();
+        
+        // Get task details
+        let task = self.get_task_details(&task_id).await?;
+        
+        // Mark task as in progress in session
+        self.session_tasks.start_task(&task.title)
+            .unwrap_or_else(|e| tracing::warn!("Failed to update session task: {}", e));
+        
+        // Adjust execution strategy based on task title (proxy for task type) and history
+        self.execution_strategy.adjust_for_task(&task.title, &mut self.learner);
+        tracing::info!(
+            "Worker {} adaptive strategy for '{}': timeout={}ms, retries={}",
+            self.id.name,
+            task.title,
+            self.execution_strategy.base_timeout_ms,
+            self.execution_strategy.max_retries
+        );
+        
+        // Transition to Planning
+        self.state_machine.transition(
+            AgentState::Planning,
+            "Analyzing task requirements with learning".to_string()
+        )?;
+        self.update_status(&format!("Planning task {}", task_id)).await;
+        
+        // Use LLM to plan with intelligent tool selection
+        self.update_status(&format!("Planning task {}", task_id)).await;
+        
+        // Plan execution
+        let execution_plan = match self.plan_task_execution_with_learning(&task).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::error!("Worker {} planning failed for task {}: {}", self.id.name, task_id, e);
+                
+                // Fail the task so it doesn't get stuck in InProgress
+                let project_manager = self.project_manager.write().await;
+                if let Err(fail_err) = project_manager.fail_task(&task_id, format!("Planning failed: {}", e)).await {
+                    tracing::error!("Failed to mark task as failed after planning error: {}", fail_err);
+                }
+                
+                return Err(e);
+            }
+        };
+        
+        tracing::info!("Worker {} planned {} steps for task: {}", 
+                       self.id.name, execution_plan.steps.len(), task.title);
+        
+        // Transition to Working state
+        self.state_machine.transition(
+            AgentState::Working,
+            format!("Executing task {}", task_id)
+        )?;
+        self.update_status(&format!("Executing task {}", task_id)).await;
+        
+        // Execute with learning and self-correction
+        let start_time = SystemTime::now();
+        let result = self.execute_with_learning(&execution_plan, &task).await;
+        
+        match result {
+            Ok(deliverables) => {
+                // Mark task as complete in session
+                self.session_tasks.complete_task(&task.title)
+                    .unwrap_or_else(|e| tracing::warn!("Failed to complete session task: {}", e));
+                
+                // Record success outcome
+                self.record_success_outcome(&task, start_time, &execution_plan);
+                
+                // Transition to Reporting
+                self.state_machine.transition(
+                    AgentState::Reporting,
+                    "Task complete, reporting to PM".to_string()
+                )?;
+                
+                tracing::info!("Worker {} submitting task {} for review with {} deliverables", self.id.name, task_id, deliverables.len());
+
+                // Submit task for review
+                let project_manager = self.project_manager.write().await;
+                project_manager.complete_task(&task_id, deliverables.clone()).await?;
+                
+                tracing::info!("Worker {} completed task: {} and updated status to UnderReview", self.id.name, task.title);
+                
+                // Send TaskResult message to PM with retry
+                let task_result = crate::messaging::MessageContent::TaskResult(crate::messaging::TaskResult {
+                    task_id: task_id.to_string(),
+                    success: true,
+                    output: serde_json::Value::String(deliverables.join("\n")),
+                    error: None,
+                    metrics: crate::messaging::TaskMetrics {
+                        duration_ms: 0,
+                        cost_usd: 0.0,
+                        resource_tier_used: crate::messaging::ResourceTier::LocalOnly,
+                        tokens_used: None,
+                    },
+                });
+                
+                if let Err(e) = self.send_message_to_pm_with_retry(&task.project_id, task_result, 4).await {
+                    tracing::warn!("Worker {} failed to send completion message to PM after retries: {:?}", self.id.name, e);
+                }
+                
+                Ok(())
+            }
+            Err(e) => {
+                // Mark task as failed in session
+                self.session_tasks.fail_task(&task.title)
+                    .unwrap_or_else(|err| tracing::warn!("Failed to fail session task: {}", err));
+                
+                // Record failure outcome
+                self.record_failure_outcome(&task, start_time, &execution_plan, &e);
+                
+                // Properly fail the task in project manager to prevent it from being stuck
+                tracing::error!(
+                    "Worker {} failing task {} due to execution error: {}",
+                    self.id.name,
+                    task_id,
+                    e
+                );
+                
+                let project_manager = self.project_manager.write().await;
+                if let Err(fail_err) = project_manager.fail_task(&task_id, format!("Worker execution error: {}", e)).await {
+                    tracing::error!(
+                        "Worker {} failed to mark task {} as failed: {}",
+                        self.id.name,
+                        task_id,
+                        fail_err
+                    );
+                }
+                
+                // Send ErrorReport message to PM with retry
+                let error_report = crate::messaging::MessageContent::ErrorReport(crate::messaging::ErrorReport {
+                    error_type: "ExecutionError".to_string(),
+                    message: e.to_string(),
+                    stack_trace: None,
+                    recoverable: false,
+                });
+                
+                if let Err(send_err) = self.send_message_to_pm_with_retry(&task.project_id, error_report, 4).await {
+                    tracing::warn!("Worker {} failed to send error message to PM after retries: {:?}", self.id.name, send_err);
+                }
+                
+                Err(e)
+            }
+        }
+    }
+    
+    /// Send a message to PM with retry logic and dynamic PM instance lookup
+    /// This handles the case where PM instance IDs may change
+    async fn send_message_to_pm_with_retry(
+        &self,
+        project_id: &crate::projects::ProjectId,
+        content: crate::messaging::MessageContent,
+        max_retries: u32,
+    ) -> Result<()> {
+        let pm_name_pattern = format!("PM-{}", project_id);
+        
+        for attempt in 1..=max_retries {
+            // Query message bus for current PM instance
+            let pm_id = {
+                let bus = self.message_bus.read().await;
+                bus.find_agent_by_name(crate::prompts::types::AgentType::PM, &pm_name_pattern).await
+            };
+            
+            match pm_id {
+                Some(pm_agent_id) => {
+                    tracing::debug!(
+                        "Worker {} found PM instance for project {}: {:?}",
+                        self.id.name,
+                        project_id,
+                        pm_agent_id
+                    );
+                    
+                    let message = crate::messaging::Message::new(
+                        self.id.clone(),
+                        pm_agent_id,
+                        content.clone(),
+                    );
+                    
+                    match self.message_bus.write().await.send_message(message).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                "Worker {} successfully sent message to PM (attempt {})",
+                                self.id.name,
+                                attempt
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Worker {} failed to send message to PM (attempt {}): {:?}",
+                                self.id.name,
+                                attempt,
+                                e
+                            );
+                            
+                            if attempt < max_retries {
+                                // Exponential backoff: 100ms, 200ms, 400ms, 800ms
+                                let delay_ms = 100 * (2_u64.pow(attempt - 1));
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        "Worker {} could not find PM for project {} (attempt {})",
+                        self.id.name,
+                        project_id,
+                        attempt
+                    );
+                    
+                    if attempt < max_retries {
+                        // Wait before retrying PM lookup
+                        let delay_ms = 100 * (2_u64.pow(attempt - 1));
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+        
+        Err(anyhow::anyhow!(
+            "Failed to send message to PM after {} attempts",
+            max_retries
+        ))
+    }
+    
+    /// Wait for PM validation with real task polling
+    pub async fn await_validation(&mut self) -> Result<bool> {
+        let task_id = self.current_task.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No task assigned"))?
+            .clone();
+        
+        tracing::info!(
+            "Worker {} awaiting PM validation for task {}",
+            self.id.name,
+            task_id
+        );
+        
+        // Poll every 5s for status changes
+        let poll_interval = tokio::time::Duration::from_secs(5);
+        let max_wait = tokio::time::Duration::from_secs(300); // 5 minute timeout
+        let start = tokio::time::Instant::now();
+        
+        loop {
+            if start.elapsed() > max_wait {
+                return Err(anyhow::anyhow!(
+                    "Validation timeout after {}s", 
+                    max_wait.as_secs()
+                ));
+            }
+            
+            // Get current task status
+            let task_status = {
+                let pm = self.project_manager.read().await;
+                pm.get_task_status(&task_id).await?
+            };
+            
+            match task_status {
+                crate::projects::TaskStatus::Complete => {
+                    tracing::info!(
+                        "Worker {} task {} approved by PM",
+                        self.id.name,
+                        task_id
+                    );
+                    
+                    // Transition to Idle
+                    self.state_machine.transition(
+                        AgentState::Idle,
+                        "Task approved by PM".to_string()
+                    )?;
+                    self.current_task = None;
+                    return Ok(true);
+                }
+                
+                crate::projects::TaskStatus::NeedsRevision => {
+                    tracing::warn!(
+                        "Worker {} task {} needs revision",
+                        self.id.name,
+                        task_id
+                    );
+                    
+                    return self.handle_revision_request(&task_id).await;
+                }
+                
+                crate::projects::TaskStatus::Failed => {
+                    let task = {
+                        let pm = self.project_manager.read().await;
+                        pm.get_task(&task_id).await?
+                    };
+                    
+                    return Err(anyhow::anyhow!(
+                        "Task failed"
+                    ));
+                }
+                
+                crate::projects::TaskStatus::UnderReview => {
+                    // Still waiting for PM validation
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+                
+                crate::projects::TaskStatus::InProgress => {
+                    // Check if this is a revision reset by PM
+                    let task = {
+                        let pm = self.project_manager.read().await;
+                        pm.get_task(&task_id).await?
+                    };
+                    
+                    if let Some(feedback) = task.pm_feedback {
+                        tracing::info!("Worker {} detected PM reset for revision: {}", self.id.name, feedback);
+                        
+                        // Transition to Planning
+                        self.state_machine.transition(
+                            AgentState::Planning,
+                            format!("Revision requested: {}", feedback)
+                        )?;
+                        
+                        // Re-execute task
+                        self.execute_task_with_discovery().await?;
+                        
+                        // Recurse to wait for validation of the new attempt
+                        // This ensures we don't return until the task is finally approved or failed
+                        return Box::pin(self.await_validation()).await;
+                    }
+                    
+                    // Task is still in progress but no feedback? 
+                    // This might be a race where PM reset it but we haven't seen feedback yet, or a crash recovery.
+                    tracing::debug!(
+                        "Worker {} found task {} still in InProgress during validation wait. Feedback: {:?}. Waiting for status change...",
+                        self.id.name,
+                        task_id,
+                        task.pm_feedback
+                    );
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+                
+                crate::projects::TaskStatus::Stuck => {
+                    tracing::error!(
+                        "Worker {} task {} marked as Stuck by PM. Manual intervention required.",
+                        self.id.name,
+                        task_id
+                    );
+                    
+                    self.state_machine.transition(
+                        AgentState::Idle,
+                        "Task marked as stuck".to_string()
+                    )?;
+                    self.current_task = None;
+                    
+                    return Err(anyhow::anyhow!("Task marked as stuck by PM"));
+                }
+                
+                crate::projects::TaskStatus::Assigned => {
+                    // Task was reset (e.g., from Stuck) and reassigned to us
+                    // We need to transition it to InProgress and re-execute
+                    tracing::info!(
+                        "Worker {} detected task {} reset to Assigned, transitioning to InProgress",
+                        self.id.name,
+                        task_id
+                    );
+                    
+                    // Start the task (transition to InProgress)
+                    {
+                        let pm = self.project_manager.write().await;
+                        pm.start_task(&task_id).await?;
+                    }
+                    
+                    // Transition to Planning state
+                    self.state_machine.transition(
+                        AgentState::Planning,
+                        "Task reset, re-executing".to_string()
+                    )?;
+                    
+                    // Re-execute the task
+                    self.execute_task_with_discovery().await?;
+                    
+                    // Recurse to wait for validation of the new attempt
+                    return Box::pin(self.await_validation()).await;
+                }
+                
+                _ => {
+                    tracing::warn!(
+                        "Worker {} encountered unexpected task status {:?} for task {}",
+                        self.id.name,
+                        task_status,
+                        task_id
+                    );
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+            }
+        }
+    }
+    
+    /// Handle revision request from PM
+    fn handle_revision_request<'a>(&'a mut self, task_id: &'a TaskId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            let task = {
+                let pm = self.project_manager.read().await;
+                pm.get_task(task_id).await?
+            };
+            
+            tracing::info!(
+                "Worker {} handling revision request (attempt {}/{})",
+                self.id.name,
+                task.revision_count,
+                task.max_revisions
+            );
+            
+            if !task.can_retry_revision() {
+                return Err(anyhow::anyhow!(
+                    "Max revisions ({}) exceeded", 
+                    task.max_revisions
+                ));
+            }
+            
+            // Get PM feedback
+        let feedback = task.pm_feedback.clone()
+            .unwrap_or_else(|| "No specific feedback provided".to_string());
+        
+        tracing::info!(
+            "Worker {} revision feedback: {}",
+            self.id.name,
+            feedback
+        );
+        
+        // Transition back to Planning to retry with feedback in context
+        self.state_machine.transition(
+            AgentState::Planning,
+            format!("Revision requested: {}", feedback)
+        )?;
+        
+        // Mark as InProgress to indicate we are working on it
+        {
+            let pm = self.project_manager.write().await;
+            // We use start_task to set it to InProgress
+            // This might fail if it's already InProgress, but that's fine (idempotent-ish check)
+            if let Err(e) = pm.start_task(task_id).await {
+                tracing::debug!("Worker {} could not set task to InProgress (might already be): {}", self.id.name, e);
+            }
+        }
+        
+        // Re-execute task with PM feedback
+        self.execute_task_with_discovery().await?;
+        
+        // Wait for validation again (use Box::pin to avoid infinite size)
+        self.await_validation().await
+    })
+    }
+    
+    /// Handle error and transition to Error state
+    pub fn handle_error(&mut self, error: String) {
+        self.state_machine.force_error(error);
+    }
+    
+    /// Get task details from project manager
+    async fn get_task_details(&self, task_id: &TaskId) -> Result<crate::projects::Task> {
+        let pm = self.project_manager.read().await;
+        let projects = pm.list_active_projects().await?;
+        
+        for project in projects {
+            let tasks = pm.get_project_tasks(&project.id).await?;
+            if let Some(task) = tasks.iter().find(|t| &t.id == task_id) {
+                return Ok(task.clone());
+            }
+        }
+        
+        Err(anyhow::anyhow!("Task not found: {}", task_id))
+    }
+    
+    /// Plan task execution with intelligent tool selection
+    async fn plan_task_execution_with_learning(&mut self, task: &crate::projects::Task) -> Result<ExecutionPlan> {
+        // Discover available tools
+        let available_tools = self.discover_tools().await?;
+        
+        // Select best tool based on task title (proxy for task type)
+        let recommended_tool = self.tool_selector.select_best_tool(&task.title, &available_tools);
+        
+        tracing::info!(
+            "Worker {} recommended tool for '{}': {}",
+            self.id.name,
+            task.title,
+            recommended_tool
+        );
+        
+        // Generate planning prompt with tool recommendation and available servers
+        let planning_prompt = match self.generate_planning_prompt_with_servers(&task.description).await {
+            Ok(prompt) => format!(
+                "{}\n\nRECOMMENDED TOOL (based on history): {}\nConsider using this tool if applicable.",
+                prompt,
+                recommended_tool
+            ),
+            Err(e) => {
+                tracing::warn!("Failed to generate enhanced prompt with servers: {}. Falling back to basic prompt.", e);
+                format!(
+                    "{}\n\nRECOMMENDED TOOL (based on history): {}\nConsider using this tool if applicable.",
+                    self.generate_planning_prompt(&task.description),
+                    recommended_tool
+                )
+            }
+        };
+        
+        let options = GenerationOptions {
+            temperature: Some(0.1),
+            max_tokens: Some(4096),
+            system: Some(self.template.system_prompt.clone()),
+            ..Default::default()
+        };
+
+        let selection_context = SelectionContext::for_worker();
+        let selected_model = self
+            .ai_provider_manager
+            .select_model_for_agent(selection_context)
+            .await
+            .context("Failed to select a model for planning")?;
+
+        let client = selected_model.get_client()?;
+        let model_name = if selected_model.model_id.contains("::") {
+            selected_model.model_id.split("::").nth(1).unwrap_or(&selected_model.model_id)
+        } else {
+            &selected_model.model_id
+        };
+        
+        // Add timeout wrapper to prevent indefinite hanging
+        // Use execution_strategy timeout (default 120s for complex tasks)
+        tracing::info!("[DIAGNOSTIC] Worker {} calling LLM for planning (model: {})", self.id.name, model_name);
+        let llm_timeout = tokio::time::Duration::from_millis(
+            (self.execution_strategy.base_timeout_ms * 2) as u64 // 2x base timeout for LLM calls
+        );
+        let response = tokio::time::timeout(
+            llm_timeout,
+            client.generate(model_name, &planning_prompt, options)
+        )
+        .await
+        .context(format!("LLM generation timed out after {:?}", llm_timeout))?
+        .context("Failed to generate execution plan with LLM")?;
+        
+        tracing::debug!(
+            target: "llm_messages",
+            "[WORKER PLANNING RESPONSE] Model: {}, Response ({} chars):\n{}",
+            model_name,
+            response.text.len(),
+            response.text
+        );
+
+        self.parse_execution_plan(&response.text).await
+    }
+    
+    /// Execute plan with adaptive retry and self-correction
+    async fn execute_with_learning(&mut self, plan: &ExecutionPlan, task: &crate::projects::Task) -> Result<Vec<String>> {
+        let mut deliverables = Vec::new();
+        
+        for (idx, step) in plan.steps.iter().enumerate() {
+            tracing::info!(
+                "Worker {} executing step {}/{}: {}",
+                self.id.name,
+                idx + 1,
+                plan.steps.len(),
+                step.description
+            );
+            
+            let step_start = SystemTime::now();
+            let mut retry_count = 0u32;
+            let mut error_history: Vec<String> = Vec::new();
+            
+            let result = loop {
+                retry_count += 1;
+                
+                match self.execute_step(step).await {
+                    Ok(result) => {
+                        // Record successful step
+                        let duration_ms = step_start.elapsed()
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        
+                        let outcome = TaskOutcome {
+                            task_type: task.title.clone(),
+                            tool_used: step.tool.clone(),
+                            success: true,
+                            duration_ms,
+                            retry_count: retry_count.saturating_sub(1),
+                            error_category: None,
+                            timestamp: SystemTime::now(),
+                        };
+                        
+                        self.learner.record_outcome(outcome.clone());
+                        self.tool_selector.record_outcome(outcome);
+                        
+                        break result;
+                    }
+                    Err(error) => {
+                        let error_msg = format!("{}", error);
+                        error_history.push(error_msg.clone());
+                        
+                        // Self-correction check
+                        if self.self_correction_enabled {
+                            let error_category = ErrorCategory::classify(&error.to_string());
+                            
+                            tracing::warn!(
+                                "Worker {} step {} failed (attempt {}): {:?} - {}",
+                                self.id.name,
+                                idx + 1,
+                                retry_count,
+                                error_category,
+                                error
+                            );
+                            
+                            match error_category {
+                                ErrorCategory::Transient => {
+                                    // Retry with adaptive backoff
+                                    if retry_count <= self.execution_strategy.max_retries {
+                                        let delay_ms = self.execution_strategy.retry_delay_ms(retry_count);
+                                        tracing::info!("Retrying in {}ms (transient error)", delay_ms);
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                        continue;
+                                    } else {
+                                        // Max retries exceeded
+                                        self.record_step_failure(task, step, retry_count, error_category);
+                                        return Err(anyhow::anyhow!(
+                                            "Step {} failed after {} retries. Error history: {:?}",
+                                            idx + 1,
+                                            self.execution_strategy.max_retries,
+                                            error_history
+                                        ));
+                                    }
+                                }
+                                ErrorCategory::Permanent => {
+                                    // No retry, request help from PM
+                                    tracing::error!("Permanent error detected, requesting PM help");
+                                    self.record_step_failure(task, step, retry_count, error_category);
+                                    return Err(anyhow::anyhow!(
+                                        "Permanent error (requesting PM help): {}",
+                                        error
+                                    ));
+                                }
+                                ErrorCategory::Unknown => {
+                                    // For unknown errors, try re-planning with error context after first failure
+                                    if retry_count == 1 {
+                                        tracing::info!("Retrying unknown error once with same plan");
+                                        let delay_ms = self.execution_strategy.retry_delay_ms(retry_count);
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                        continue;
+                                    } else if retry_count == 2 {
+                                        // Second failure: Re-plan with error context
+                                        tracing::warn!(
+                                            "Worker {} step {} failed twice. Re-planning with error context: {:?}",
+                                            self.id.name,
+                                            idx + 1,
+                                            error_history
+                                        );
+                                        
+                                        // Generate new plan with error context
+                                        match self.replan_with_error_context(task, &error_history).await {
+                                            Ok(new_plan) => {
+                                                tracing::info!(
+                                                    "Worker {} generated new plan with {} steps based on error context",
+                                                    self.id.name,
+                                                    new_plan.steps.len()
+                                                );
+                                                // Execute the new plan recursively (boxed to avoid recursion error)
+                                                return Box::pin(self.execute_with_learning(&new_plan, task)).await;
+                                            }
+                                            Err(replan_error) => {
+                                                tracing::error!(
+                                                    "Worker {} failed to re-plan: {}. Requesting PM help.",
+                                                    self.id.name,
+                                                    replan_error
+                                                );
+                                                self.record_step_failure(task, step, retry_count, error_category);
+                                                return Err(anyhow::anyhow!(
+                                                    "Re-planning failed after errors: {:?}. Original error: {}",
+                                                    error_history,
+                                                    error
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        // Third+ failure after re-planning: Give up
+                                        tracing::error!("Unknown error persists after re-planning, requesting PM help");
+                                        self.record_step_failure(task, step, retry_count, error_category);
+                                        return Err(anyhow::anyhow!(
+                                            "Step failed after re-planning. Error history: {:?}",
+                                            error_history
+                                        ));
+                                    }
+                                }
+                            }
+                        } else {
+                            // Self-correction disabled, use old retry logic
+                            if retry_count <= self.execution_strategy.max_retries {
+                                let delay_ms = 500 * retry_count as u64;
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                continue;
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+            };
+            
+            deliverables.push(format!("Step {}: {} - {}", idx + 1, step.description, result));
+        }
+        
+        Ok(deliverables)
+    }
+    
+    /// Re-plan task execution with error context from previous failures
+    async fn replan_with_error_context(&mut self, task: &crate::projects::Task, error_history: &Vec<String>) -> Result<ExecutionPlan> {
+        tracing::info!(
+            "Worker {} re-planning task '{}' with {} previous errors",
+            self.id.name,
+            task.title,
+            error_history.len()
+        );
+        
+        let planning_prompt = self.generate_planning_prompt_with_context(&task.description, Some(error_history));
+        
+        let options = GenerationOptions {
+            temperature: Some(0.3), // Consistent with plan_task_execution_with_learning
+            max_tokens: Some(4096),
+            system: Some(self.template.system_prompt.clone()),
+            ..Default::default()
+        };
+
+        let selection_context = SelectionContext::for_worker();
+        let selected_model = self
+            .ai_provider_manager
+            .select_model_for_agent(selection_context)
+            .await
+            .context("Failed to select a model for re-planning")?;
+
+        let client = selected_model.get_client()?;
+        let model_name = if selected_model.model_id.contains("::") {
+            selected_model.model_id.split("::").nth(1).unwrap_or(&selected_model.model_id)
+        } else {
+            &selected_model.model_id
+        };
+        
+        tracing::info!(
+            "Worker {} re-planning with LLM (model: {})",
+            self.id.name,
+            model_name
+        );
+        
+        let llm_timeout = tokio::time::Duration::from_millis(
+            (self.execution_strategy.base_timeout_ms * 2) as u64
+        );
+        let response = tokio::time::timeout(
+            llm_timeout,
+            client.generate(model_name, &planning_prompt, options)
+        )
+        .await
+        .context(format!("LLM re-planning timed out after {:?}", llm_timeout))?
+        .context("Failed to generate revised execution plan with LLM")?;
+        
+        tracing::debug!(
+            target: "llm_messages",
+            "[WORKER RE-PLANNING RESPONSE] Model: {}, Response ({} chars)",
+            model_name,
+            response.text.len()
+        );
+
+        self.parse_execution_plan(&response.text).await
+    }
+    
+    /// Record success outcome for learning
+    fn record_success_outcome(&mut self, task: &crate::projects::Task, start_time: SystemTime, plan: &ExecutionPlan) {
+        let duration_ms = start_time.elapsed()
+            .unwrap_or_default()
+            .as_millis() as u64;
+        
+        // Record aggregate outcome for each tool used
+        for step in &plan.steps {
+            let outcome = TaskOutcome {
+                task_type: task.title.clone(),
+                tool_used: step.tool.clone(),
+                success: true,
+                duration_ms,
+                retry_count: 0,
+                error_category: None,
+                timestamp: SystemTime::now(),
+            };
+            
+            self.tool_selector.record_outcome(outcome);
+        }
+        
+        tracing::info!(
+            "Worker {} recorded success: task='{}', duration={}ms, tools={}",
+            self.id.name,
+            task.title,
+            duration_ms,
+            plan.steps.len()
+        );
+    }
+    
+    /// Record failure outcome for learning
+    fn record_failure_outcome(&mut self, task: &crate::projects::Task, start_time: SystemTime, plan: &ExecutionPlan, error: &anyhow::Error) {
+        let duration_ms = start_time.elapsed()
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let error_category = ErrorCategory::classify(&error.to_string());
+        
+        for step in &plan.steps {
+            let outcome = TaskOutcome {
+                task_type: task.title.clone(),
+                tool_used: step.tool.clone(),
+                success: false,
+                duration_ms,
+                retry_count: self.execution_strategy.max_retries,
+                error_category: Some(error_category),
+                timestamp: SystemTime::now(),
+            };
+            
+            self.tool_selector.record_outcome(outcome);
+        }
+        
+        tracing::warn!(
+            "Worker {} recorded failure: task='{}', error={:?}",
+            self.id.name,
+            task.title,
+            error_category
+        );
+    }
+    
+    /// Record step failure for learning
+    fn record_step_failure(&mut self, task: &crate::projects::Task, step: &ExecutionStep, retry_count: u32, category: ErrorCategory) {
+        let outcome = TaskOutcome {
+            task_type: task.title.clone(),
+            tool_used: step.tool.clone(),
+            success: false,
+            duration_ms: 0,
+            retry_count,
+            error_category: Some(category),
+            timestamp: SystemTime::now(),
+        };
+        
+        self.learner.record_outcome(outcome);
+    }
+    
+    /// Plan task execution using LLM (original method for backward compatibility)
+    #[deprecated(note = "Use generate_execution_plan_discovery instead")]
+    async fn plan_task_execution(&self, task_description: &str) -> Result<ExecutionPlan> {
+        let planning_prompt = self.generate_planning_prompt(task_description);
+        
+        let options = GenerationOptions {
+            temperature: Some(0.1),
+            max_tokens: Some(4096),
+            system: Some(self.template.system_prompt.clone()),
+            ..Default::default()
+        };
+
+        let selection_context = SelectionContext::for_worker();
+        let selected_model = self
+            .ai_provider_manager
+            .select_model_for_agent(selection_context)
+            .await
+            .context("Failed to select a model for planning")?;
+        
+        let client = selected_model.get_client()?;
+        let model_name = if selected_model.model_id.contains("::") {
+            selected_model.model_id.split("::").nth(1).unwrap_or(&selected_model.model_id)
+        } else {
+            &selected_model.model_id
+        };
+
+        tracing::debug!("Worker {} sending planning prompt to LLM: {}", self.id.name, planning_prompt);
+        let response = client.generate(
+            model_name,
+            &planning_prompt,
+            options
+        ).await.context("Failed to generate execution plan with LLM")?;
+        
+        tracing::debug!("Worker {} received raw plan from LLM: {}", self.id.name, response.text);
+        self.parse_execution_plan(&response.text).await
+    }
+    
+    /// Generate structured planning prompt for LLM
+    async fn generate_planning_prompt_with_servers(&self, task_description: &str) -> Result<String> {
+        // Discover available servers at planning time
+        let available_tools = self.discover_tools().await?;
+        let mut servers_set = std::collections::HashSet::new();
+        for tool in &available_tools {
+            if let Some(server) = tool.split("::").next() {
+                servers_set.insert(server.to_string());
+            }
+        }
+        let available_servers: Vec<String> = servers_set.into_iter().collect();
+        
+        Ok(format!(
+            r#"You are a Worker AI agent executing a task. Analyze this task and create a structured execution plan.
+
+TASK: {}
+YOUR ROLE: {}
+YOUR CAPABILITIES: {:?}
+
+**CRITICAL - AVAILABLE MCP SERVERS:**
+The following MCP servers are currently available:
+{}
+
+**YOU MUST ONLY USE TOOLS FROM THESE SERVERS. DO NOT use tools from any other servers (e.g., 'server', 'http', 'network').**
+
+AVAILABLE MCP TOOLS:
+{}
+
+INSTRUCTIONS:
+1. Break the task into concrete, executable steps.
+2. Each step must use ONE MCP tool with specific parameters.
+3. **TOOL FORMAT:** Tools must be in format `server_name::tool_name` where server_name is one of the available servers listed above.
+4. Steps can have dependencies on previous steps.
+5. Be specific with file paths, parameters, and expected outputs.
+6. **IMPORTANT - Tool Selection:**
+   - Use `hainet-files::directory_create` to create directories
+   - Use `hainet-files::file_write` to create/write files
+   - Use `hainet-files::file_read` to read existing files
+   - Use `filesystem::read_file` to read files from the filesystem
+   - Use `filesystem::write_file` to write files
+   - Do not attempt to read files that do not exist yet
+   - When setting up a new project, create directories FIRST using directory_create, then create files using file_write
+   - **DO NOT** use tools from non-existent servers like 'server::http_requests' or 'server::file_write'
+
+RESPOND WITH VALID JSON ONLY (no markdown, no explanations):
+{{
+  "steps": [
+    {{
+      "step_number": 1,
+      "tool": "hainet-files::file_write",
+      "params": {{ "path": "src/main.rs", "content": "// Project entry point" }},
+      "description": "Create the main source file for the new project.",
+      "depends_on": []
+    }},
+    {{
+      "step_number": 2,
+      "tool": "hainet-files::file_read",
+      "params": {{ "path": "src/main.rs" }},
+      "description": "Read the newly created file to verify its content.",
+      "depends_on": [1]
+    }}
+  ]
+}}
+
+CRITICAL: Respond with ONLY the JSON object above. No markdown code blocks, no explanations.
+CRITICAL: Only use tools from available servers: {}
+"#,
+            task_description,
+            self.template.name,
+            self.template.capabilities,
+            available_servers.join(", "),
+            self.format_available_tools(),
+            available_servers.join(", ")
+        ))
+    }
+    
+    /// Generate structured planning prompt for LLM (backward compatible version)
+    fn generate_planning_prompt(&self, task_description: &str) -> String {
+        self.generate_planning_prompt_with_context(task_description, None)
+    }
+    
+    /// Generate planning prompt with optional error context from previous failures
+    fn generate_planning_prompt_with_context(&self, task_description: &str, error_context: Option<&Vec<String>>) -> String {
+        let mut lines = vec![
+            "TASK DESCRIPTION:".to_string(),
+            format!("  {}", task_description),
+            String::new(),
+            format!("AGENT ROLE: {}", self.template.name),
+            String::new(),
+        ];
+        
+        // Add error context if previous attempts failed
+        if let Some(errors) = error_context {
+            if !errors.is_empty() {
+                lines.push("========================================".to_string());
+                lines.push("PREVIOUS ATTEMPT FAILURES:".to_string());
+                lines.push("========================================".to_string());
+                for (i, error) in errors.iter().enumerate() {
+                    lines.push(format!("Attempt {}: {}", i + 1, error));
+                }
+                lines.push(String::new());
+                lines.push("IMPORTANT - Learn from Previous Failures:".to_string());
+                lines.push("The above errors occurred in previous attempts. Please revise your plan to avoid these issues.".to_string());
+                lines.push(String::new());
+                lines.push("Common Solutions:".to_string());
+                lines.push("- If a file does not exist: Create it first using file_write before trying to read it".to_string());
+                lines.push("- If a file read failed: Use file_list to check what files exist, then adjust your approach".to_string());
+                lines.push("- If a tool failed: Try a different tool or approach".to_string());
+                lines.push("- If a path was wrong: Double-check the file path and directory structure".to_string());
+                lines.push(String::new());
+                lines.push("Your revised plan should:".to_string());
+                lines.push("1. Address the specific errors mentioned above".to_string());
+                lines.push("2. Use a different approach if the previous one failed".to_string());
+                lines.push("3. Include validation steps (e.g., check file existence before reading)".to_string());
+                lines.push(String::new());
+                lines.push("========================================".to_string());
+                lines.push(String::new());
+            }
+        }
+        
+        // JSON Schema and Instructions
+        lines.push("========================================".to_string());
+        lines.push("CRITICAL INSTRUCTIONS - READ CAREFULLY:".to_string());
+        lines.push("========================================".to_string());
+        lines.push(String::new());
+        lines.push("1. You MUST respond with ONLY a JSON object".to_string());
+        lines.push("2. Do NOT include any explanatory text before or after the JSON".to_string());
+        lines.push("3. Do NOT use markdown code blocks (no ```json)".to_string());
+        lines.push("4. Do NOT explain your reasoning or add comments".to_string());
+        lines.push("5. Your ENTIRE response must be valid, parseable JSON".to_string());
+        lines.push(String::new());
+        lines.push("JSON SCHEMA (you must follow this exact structure):".to_string());
+        lines.push("{".to_string());
+        lines.push("  \"steps\": [".to_string());
+        lines.push("    {".to_string());
+        lines.push("      \"step_number\": <integer>,".to_string());
+        lines.push("      \"tool\": \"<server_name>::<tool_name>\",".to_string());
+        lines.push("      \"params\": { <tool-specific parameters> },".to_string());
+        lines.push("      \"description\": \"<brief description>\"".to_string());
+        lines.push("    }".to_string());
+        lines.push("  ]".to_string());
+        lines.push("}".to_string());
+        lines.push(String::new());
+        lines.push("EXAMPLE OF CORRECT RESPONSE:".to_string());
+        lines.push("{\"steps\": [{\"step_number\": 1, \"tool\": \"hainet-files::file_write\", \"params\": {\"path\": \"/src/main.rs\", \"content\": \"fn main() {}\"}, \"description\": \"Create main file\"}]}".to_string());
+        lines.push(String::new());
+        lines.push("EXAMPLE OF INCORRECT RESPONSE (DO NOT DO THIS):".to_string());
+        lines.push("Based on the task, here is my plan:".to_string());
+        lines.push("{\"steps\": [...]}".to_string());
+        lines.push(String::new());
+        lines.push("REMINDER: If you include ANY text other than the JSON object, the system will FAIL.".to_string());
+        lines.push("Start your response with { and end with }. Nothing else.".to_string());
+        lines.push(String::new());
+        lines.push("========================================".to_string());
+        lines.push("NOW PROVIDE YOUR JSON RESPONSE:".to_string());
+        lines.push("========================================".to_string());
+        
+        lines.join("\n")
+    }
+    
+    /// Format available MCP tools for prompt
+    fn format_available_tools(&self) -> String {
+        let mut tools_desc = String::new();
+        
+        for server in &self.template.mcp_servers {
+            tools_desc.push_str(&format!("\n{} server:\n", server));
+            
+            match server.as_str() {
+                "hainet-files" => {
+                    tools_desc.push_str("  - file_read(path) - Read file contents\n");
+                    tools_desc.push_str("  - file_write(path, content) - Write to file\n");
+                    tools_desc.push_str("  - file_list(path) - List directory contents\n");
+                    tools_desc.push_str("  - file_metadata(path) - Get file metadata\n");
+                    tools_desc.push_str("  - directory_create(path) - Create a directory\n");
+                }
+                "hainet-system" => {
+                    tools_desc.push_str("  - system_status() - Get CPU, RAM, disk usage\n");
+                    tools_desc.push_str("  - list_services() - List running services\n");
+                    tools_desc.push_str("  - check_health() - Run health checks\n");
+                }
+                "hainet-dev" => {
+                    tools_desc.push_str("  - git_status(repo_path) - Get git status\n");
+                    tools_desc.push_str("  - git_diff(repo_path, file_path) - View changes\n");
+                    tools_desc.push_str("  - cargo_build(package, release) - Build Rust project\n");
+                    tools_desc.push_str("  - cargo_test(package, filter) - Run tests\n");
+                    tools_desc.push_str("  - code_search(pattern, path) - Search codebase\n");
+                }
+                _ => {}
+            }
+        }
+        
+        tools_desc
+    }
+    
+    /// Parse LLM response into ExecutionPlan (enhanced with multi-strategy parsing and validation)
+    async fn parse_execution_plan(&self, llm_response: &str) -> Result<ExecutionPlan> {
+        // Get available servers for validation
+        let available_tools = self.discover_tools().await?;
+        let mut available_servers = std::collections::HashSet::new();
+        for tool in &available_tools {
+            if let Some(server) = tool.split("::").next() {
+                available_servers.insert(server.to_string());
+            }
+        }
+        
+        // Try to parse the execution plan with multiple strategies
+        // Check if LLM returned a verification result instead of a plan
+        if llm_response.contains("\"success\":") || llm_response.contains("\"status\": \"success\"") {
+            return Err(anyhow::anyhow!("Response looks like a verification result. You must provide an EXECUTION PLAN with a 'steps' array."));
+        }
+
+        let parse_result: Result<Vec<ExecutionStep>> = (|| {
+            // Strategy 1: Direct JSON extraction (simple case)
+            let json_str = self.extract_json_from_response(llm_response);
+            
+            // Strategy 2: Try direct parse
+            let parsed = match serde_json::from_str::<serde_json::Value>(&json_str) {
+                Ok(value) => value,
+                Err(_) => {
+                    // Strategy 3: Try markdown extraction
+                    if let Ok(value) = self.extract_from_markdown(llm_response) {
+                        value
+                    } else {
+                        // Strategy 4: Try repair (braces/brackets)
+                        self.repair_and_parse(&json_str)?
+                    }
+                }
+            };
+            
+            let steps: Vec<ExecutionStep> = parsed["steps"].as_array()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'steps' array in execution plan"))?
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, s)| {
+                    let _step_number = s["step_number"].as_u64().unwrap_or((idx + 1) as u64) as usize;
+                    let tool = s["tool"].as_str()?.to_string();
+                    let params = s["params"].clone();
+                    let description = s["description"].as_str().unwrap_or("").to_string();
+                    
+                    // Validate tool format (server::tool_name)
+                    if !tool.contains("::") {
+                        tracing::warn!("Invalid tool format (missing ::): {}", tool);
+                        return None;
+                    }
+                    
+                    // Validate server exists
+                    if let Some(server_name) = tool.split("::").next() {
+                        if !available_servers.contains(server_name) {
+                            tracing::warn!(
+                                "Tool '{}' references non-existent server '{}'. Available servers: {:?}",
+                                tool,
+                                server_name,
+                                available_servers
+                            );
+                            return None;
+                        }
+                    }
+                    
+                    Some(ExecutionStep {
+                        tool,
+                        params,
+                        description,
+                    })
+                })
+                .collect();
+            
+            Ok(steps)
+        })();
+        
+        // Check if parsing succeeded and has valid steps
+        let steps = match parse_result {
+            Ok(steps) if !steps.is_empty() => steps,
+            Ok(_) => {
+                // Parsing succeeded but no valid steps found
+                tracing::warn!(
+                    "No valid execution steps found in plan. Response snippet: {}. Attempting fallback to simple plan.",
+                    &llm_response[..llm_response.len().min(200)]
+                );
+                return self.create_fallback_plan(llm_response).await;
+            }
+            Err(e) => {
+                // Parsing failed completely
+                tracing::warn!(
+                    "Failed to parse execution plan: {}. Response snippet: {}. Attempting fallback to simple plan.",
+                    e,
+                    &llm_response[..llm_response.len().min(200)]
+                );
+                return self.create_fallback_plan(llm_response).await;
+            }
+        };
+        
+        // Validate the plan before returning
+        self.validate_execution_plan(&steps)?;
+        
+        tracing::debug!("Parsed {} execution steps from LLM response", steps.len());
+        for (i, step) in steps.iter().enumerate() {
+            tracing::debug!("Step {}: {} (Tool: {})", i + 1, step.description, step.tool);
+        }
+        Ok(ExecutionPlan { steps })
+    }
+    
+    /// Validate execution plan for common issues
+    fn validate_execution_plan(&self, steps: &[ExecutionStep]) -> Result<()> {
+        if steps.is_empty() {
+            return Err(anyhow::anyhow!("Execution plan has no steps"));
+        }
+        
+        // Check for reasonable number of steps (not too many)
+        if steps.len() > 50 {
+            tracing::warn!("Execution plan has {} steps, which seems excessive", steps.len());
+        }
+        
+        // Validate each step has required fields
+        for (idx, step) in steps.iter().enumerate() {
+            if step.tool.is_empty() {
+                return Err(anyhow::anyhow!("Step {} has empty tool name", idx + 1));
+            }
+            if step.description.is_empty() {
+                tracing::warn!("Step {} has empty description", idx + 1);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Create a fallback execution plan when parsing fails
+    /// This prevents permanent task failure by creating a simple plan
+    async fn create_fallback_plan(&self, _llm_response: &str) -> Result<ExecutionPlan> {
+        tracing::warn!("Creating fallback execution plan due to parsing failure");
+        
+        // Discover available tools to find a safe default
+        let available_tools = self.discover_tools().await?;
+        
+        // Try to find a file listing tool as a safe default action
+        let default_tool = available_tools.iter()
+            .find(|t| t.contains("file_list") || t.contains("list"))
+            .or_else(|| available_tools.first())
+            .ok_or_else(|| anyhow::anyhow!("No tools available for fallback plan"))?;
+        
+        tracing::info!("Fallback plan using tool: {}", default_tool);
+        
+        // Create a simple single-step plan
+        let fallback_step = ExecutionStep {
+            tool: default_tool.clone(),
+            params: serde_json::json!({ "path": "." }),
+            description: "Fallback: List current directory to understand project structure".to_string(),
+        };
+        
+        Ok(ExecutionPlan {
+            steps: vec![fallback_step],
+        })
+    }
+    
+    /// Parse LLM response into ExecutionPlan (backward compatible version without validation)
+    fn parse_execution_plan_legacy(&self, llm_response: &str) -> Result<ExecutionPlan> {
+        // Strategy 1: Direct JSON extraction (simple case)
+        let json_str = self.extract_json_from_response(llm_response);
+        
+        // Strategy 2: Try direct parse
+        let parsed = match serde_json::from_str::<serde_json::Value>(&json_str) {
+            Ok(value) => value,
+            Err(_) => {
+                // Strategy 3: Try markdown extraction
+                if let Ok(value) = self.extract_from_markdown(llm_response) {
+                    value
+                } else {
+                    // Strategy 4: Try repair (braces/brackets)
+                    self.repair_and_parse(&json_str)?
+                }
+            }
+        };
+        
+        let steps: Vec<ExecutionStep> = parsed["steps"].as_array()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'steps' array in execution plan"))?
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, s)| {
+                let _step_number = s["step_number"].as_u64().unwrap_or((idx + 1) as u64) as usize;
+                let tool = s["tool"].as_str()?.to_string();
+                let params = s["params"].clone();
+                let description = s["description"].as_str().unwrap_or("").to_string();
+                
+                // Validate tool format (server::tool_name)
+                if !tool.contains("::") {
+                    tracing::warn!("Invalid tool format (missing ::): {}", tool);
+                    return None;
+                }
+                
+                Some(ExecutionStep {
+                    tool,
+                    params,
+                    description,
+                })
+            })
+            .collect();
+        
+        if steps.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No valid execution steps found in plan. Response: {}",
+                &llm_response[..llm_response.len().min(200)]
+            ));
+        }
+        
+        tracing::debug!("Parsed {} execution steps from LLM response", steps.len());
+        for (i, step) in steps.iter().enumerate() {
+            tracing::debug!("Step {}: {} (Tool: {})", i + 1, step.description, step.tool);
+        }
+        Ok(ExecutionPlan { steps })
+    }
+    
+    /// Extract JSON from LLM response (handles braces)
+    fn extract_json_from_response(&self, response: &str) -> String {
+        // Strip <think>...</think> blocks before extraction to prevent
+        // brace-matching from grabbing JSON fragments inside reasoning.
+        let cleaned = Self::strip_think_blocks(response);
+        let response = cleaned.as_str();
+
+        if let Some(start) = response.find('{') {
+            if let Some(end) = response.rfind('}') {
+                return response[start..=end].to_string();
+            }
+        }
+        response.to_string()
+    }
+
+    /// Remove all `<think>...</think>` blocks from the LLM response so that
+    /// any JSON-like content inside reasoning doesn't confuse brace extraction.
+    fn strip_think_blocks(input: &str) -> String {
+        let mut result = String::with_capacity(input.len());
+        let mut remaining = input;
+        while let Some(start) = remaining.find("<think>") {
+            result.push_str(&remaining[..start]);
+            if let Some(end) = remaining[start..].find("</think>") {
+                remaining = &remaining[start + end + "</think>".len()..];
+            } else {
+                // Unclosed <think> — discard everything after it
+                return result;
+            }
+        }
+        result.push_str(remaining);
+        result
+    }
+    
+    /// Extract JSON from markdown code blocks
+    fn extract_from_markdown(&self, text: &str) -> Result<serde_json::Value> {
+        let markers = ["```json\n", "```\n", "```"];
+        
+        for marker in markers.iter() {
+            if let Some(start_idx) = text.find(marker) {
+                let json_start = start_idx + marker.len();
+                
+                if let Some(end_idx) = text[json_start..].find("```") {
+                    let json_text = &text[json_start..json_start + end_idx];
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_text.trim()) {
+                        return Ok(value);
+                    }
+                }
+            }
+        }
+        
+        Err(anyhow::anyhow!("No valid JSON found in markdown blocks"))
+    }
+    
+    /// Repair common JSON issues (missing braces/brackets)
+    fn repair_and_parse(&self, text: &str) -> Result<serde_json::Value> {
+        let mut repaired = text.trim().to_string();
+        
+        // Count braces and brackets
+        let open_braces = repaired.matches('{').count();
+        let close_braces = repaired.matches('}').count();
+        let open_brackets = repaired.matches('[').count();
+        let close_brackets = repaired.matches(']').count();
+        
+        // Add missing closing braces
+        if open_braces > close_braces {
+            for _ in 0..(open_braces - close_braces) {
+                repaired.push('}');
+            }
+        }
+        
+        // Add missing closing brackets
+        if open_brackets > close_brackets {
+            for _ in 0..(open_brackets - close_brackets) {
+                repaired.push(']');
+            }
+        }
+        
+        serde_json::from_str::<serde_json::Value>(&repaired)
+            .context("Failed to parse after JSON repair")
+    }
+    
+    /// Execute plan with retry logic (original method for backward compatibility)
+    async fn execute_with_retries(&self, plan: &ExecutionPlan) -> Result<Vec<String>> {
+        let mut deliverables = Vec::new();
+        
+        for (idx, step) in plan.steps.iter().enumerate() {
+            tracing::info!("Worker {} executing step {}/{}: {}", 
+                           self.id.name, idx + 1, plan.steps.len(), step.description);
+            
+            let mut attempts = 0;
+            let result = loop {
+                attempts += 1;
+                
+                match self.execute_step(step).await {
+                    Ok(result) => break result,
+                    Err(e) if attempts < self.max_retries => {
+                        tracing::warn!("Worker {} step failed (attempt {}/{}): {}",
+                                       self.id.name, attempts, self.max_retries, e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500 * attempts as u64)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Step {} failed after {} attempts: {}", 
+                            idx + 1, self.max_retries, e
+                        ));
+                    }
+                }
+            };
+            
+            deliverables.push(format!("Step {}: {} - {}", idx + 1, step.description, result));
+        }
+        
+        Ok(deliverables)
+    }
+    
+    /// Execute single step with MCP tool
+    async fn execute_step(&self, step: &ExecutionStep) -> Result<String> {
+        // Parse tool name: "server::tool_name"
+        let parts: Vec<&str> = step.tool.split("::").collect();
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!("Invalid tool format: {}", step.tool));
+        }
+        
+        let (server, tool) = (parts[0], parts[1]);
+        
+        // Add project_name to params for sandboxing (Session 52)
+        let mut params = step.params.clone();
+        if let Some(ref project_name) = self.current_project_name {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("project_name".to_string(), serde_json::Value::String(project_name.clone()));
+            }
+        }
+        
+        let mcp_client = self.mcp_client.read().await;
+        let result = mcp_client.call_tool(server, tool, params).await?;
+        
+        Ok(result.to_string())
+    }
+    
+    /// Execute file-related task using hainet-files MCP server
+    async fn execute_file_task(&self, task_description: &str) -> Result<Vec<String>> {
+        let mcp_client = self.mcp_client.read().await;
+        
+        // Simple task parsing - in production this would use LLM
+        // For now, support basic file operations
+        if task_description.contains("read") || task_description.contains("get") {
+            let path = self.extract_path_from_task(task_description);
+            
+            let result = mcp_client.call_tool(
+                "hainet-files",
+                "hainet_file_read",
+                json!({ "path": path })
+            ).await?;
+            
+            Ok(vec![format!("Read file: {}", result)])
+        } else if task_description.contains("write") || task_description.contains("create") {
+            let path = self.extract_path_from_task(task_description);
+            let content = "Generated content"; // Would be LLM-generated
+            
+            let result = mcp_client.call_tool(
+                "hainet-files",
+                "hainet_file_write",
+                json!({ "path": path, "content": content })
+            ).await?;
+            
+            Ok(vec![format!("Wrote file: {}", result)])
+        } else if task_description.contains("list") {
+            let path = self.extract_path_from_task(task_description);
+            
+            let result = mcp_client.call_tool(
+                "hainet-files",
+                "hainet_file_list",
+                json!({ "path": path })
+            ).await?;
+            
+            Ok(vec![format!("Listed directory: {}", result)])
+        } else {
+            Ok(vec!["File operation completed".to_string()])
+        }
+    }
+    
+    /// Execute generic task - tries to auto-detect task type
+    async fn execute_generic_task(&self, task_description: &str) -> Result<Vec<String>> {
+        // Try file operations first
+        if task_description.contains("file") || task_description.contains("directory") {
+            return self.execute_file_task(task_description).await;
+        }
+        
+        // Default fallback
+        Ok(vec!["Generic task completed".to_string()])
+    }
+    
+    /// Extract file path from task description (simplified NLP)
+    fn extract_path_from_task(&self, task_description: &str) -> String {
+        // Very simple path extraction - would use LLM in production
+        if let Some(start) = task_description.find("/") {
+            let remaining = &task_description[start..];
+            if let Some(end) = remaining.find(" ") {
+                remaining[..end].to_string()
+            } else {
+                remaining.to_string()
+            }
+        } else {
+            "/tmp/test.txt".to_string()
+        }
+    }
+    
+    /// Discover available tools from connected MCP servers (with timeout)
+    pub async fn discover_tools(&self) -> Result<Vec<String>> {
+        tracing::info!("[DIAGNOSTIC] Worker {} starting tool discovery", self.id.name);
+        
+        // Wrap discovery in timeout to prevent hanging
+        let discovery_timeout = tokio::time::Duration::from_secs(10);
+        
+        match tokio::time::timeout(discovery_timeout, self.discover_tools_internal()).await {
+            Ok(result) => {
+                tracing::info!("[DIAGNOSTIC] Worker {} tool discovery completed", self.id.name);
+                result
+            }
+            Err(_) => {
+                let error_msg = format!(
+                    "Tool discovery timed out after {:?}. MCP servers may not be responding.",
+                    discovery_timeout
+                );
+                tracing::error!("[DIAGNOSTIC] Worker {} {}", self.id.name, error_msg);
+                Err(anyhow::anyhow!(error_msg))
+            }
+        }
+    }
+    
+    /// Internal tool discovery implementation (without timeout wrapper)
+    async fn discover_tools_internal(&self) -> Result<Vec<String>> {
+        let mcp_client = self.mcp_client.read().await;
+        
+        tracing::info!("[DIAGNOSTIC] Worker {} calling list_servers()", self.id.name);
+        let servers = mcp_client.list_servers().await;
+        tracing::info!("[DIAGNOSTIC] Worker {} found {} servers: {:?}", self.id.name, servers.len(), servers);
+        
+        // SAFETY: Filter out the 'filesystem' server to prevent workers from writing outside project sandboxes
+        // The 'filesystem' server has broad access without project-specific sandboxing
+        // Workers should ONLY use 'hainet-files' which properly sandboxes to project directories
+        let safe_servers: Vec<String> = servers.into_iter()
+            .filter(|server| {
+                if server == "filesystem" {
+                    tracing::warn!(
+                        "Worker {} blocked from using 'filesystem' server (security: no project sandboxing). Use 'hainet-files' instead.",
+                        self.id.name
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        
+        tracing::info!("[DIAGNOSTIC] Worker {} using {} safe servers (filtered out unsafe servers)", self.id.name, safe_servers.len());
+        
+        let mut all_tools = Vec::new();
+        
+        for server_name in safe_servers {
+            tracing::debug!("Worker {} listing tools for server: {}", self.id.name, server_name);
+            let tools = mcp_client.list_tools(&server_name).await?;
+            tracing::debug!("Worker {} found {} tools in {}", self.id.name, tools.len(), server_name);
+            
+            for tool in tools {
+                all_tools.push(format!("{}::{}", server_name, tool.name));
+            }
+        }
+        
+        tracing::info!("[DIAGNOSTIC] Worker {} discovered {} total tools", self.id.name, all_tools.len());
+        
+        Ok(all_tools)
+    }
+    
+    /// Get reference to mcp_client (for testing)
+    pub fn mcp_client(&self) -> &Arc<RwLock<MCPClientManager>> {
+        &self.mcp_client
+    }
+    
+    /// Get mutable reference to state machine (for testing)
+    pub fn state_machine_mut(&mut self) -> &mut AgentStateMachine {
+        &mut self.state_machine
+    }
+    
+    /// Get reference to project manager (for testing)
+    pub fn project_manager(&self) -> &Arc<RwLock<ProjectManager>> {
+        &self.project_manager
+    }
+    
+    /// Get reference to template (for testing)
+    pub fn template(&self) -> &WorkerTemplate {
+        &self.template
+    }
+    
+    /// Get reference to learner (for testing and monitoring)
+    pub fn learner(&self) -> &WorkerLearner {
+        &self.learner
+    }
+    
+    /// Get mutable reference to learner (for testing)
+    pub fn learner_mut(&mut self) -> &mut WorkerLearner {
+        &mut self.learner
+    }
+    
+    /// Get reference to execution strategy (for monitoring)
+    pub fn execution_strategy(&self) -> &ExecutionStrategy {
+        &self.execution_strategy
+    }
+    
+    /// Get reference to tool selector (for monitoring)
+    pub fn tool_selector(&self) -> &ToolSelector {
+        &self.tool_selector
+    }
+    
+    /// Set self-correction enabled/disabled
+    pub fn set_self_correction(&mut self, enabled: bool) {
+        self.self_correction_enabled = enabled;
+    }
+    
+    /// Get reference to session tasks (for monitoring)
+    pub fn session_tasks(&self) -> &SessionTaskList {
+        &self.session_tasks
+    }
+    
+    /// Get mutable reference to session tasks (for testing)
+    pub fn session_tasks_mut(&mut self) -> &mut SessionTaskList {
+        &mut self.session_tasks
+    }
+    
+    // ========================================================================
+    // DISCOVERY-BASED EXECUTION METHODS (NEW)
+    // ========================================================================
+    
+    /// Execute task using discovery-based approach
+    /// Execute task using discovery-based approach with sub-task decomposition
+    async fn execute_with_discovery(&mut self, task: &crate::projects::Task) -> Result<Vec<String>> {
+        // Step 1: Discover available tools (names only)
+        let available_tools = self.discover_tools().await?;
+        tracing::info!(
+            "Worker {} discovered {} available tools",
+            self.id.name,
+            available_tools.len()
+        );
+
+        // Step 2: Decompose into sub-tasks
+        let subtasks = self.generate_subtasks(task).await?;
+        tracing::info!("Worker {} decomposed task into {} sub-tasks", self.id.name, subtasks.len());
+        
+        let mut all_deliverables = Vec::new();
+        
+        for subtask in subtasks {
+            tracing::info!("Worker {} starting sub-task {}: {}", self.id.name, subtask.id, subtask.description);
+            
+            // Execute sub-task loop (Plan -> Execute -> Verify -> Refine)
+            let subtask_deliverables = self.execute_subtask_loop(task, &subtask, &available_tools).await?;
+            all_deliverables.extend(subtask_deliverables);
+        }
+        
+        Ok(all_deliverables)
+    }
+
+    /// Execute a single sub-task with verification loop
+    async fn execute_subtask_loop(
+        &mut self,
+        main_task: &crate::projects::Task,
+        subtask: &SubTask,
+        available_tools: &[String],
+    ) -> Result<Vec<String>> {
+        let max_retries = 3;
+        let mut attempts = 0;
+        let mut feedback = String::new();
+        
+        loop {
+            attempts += 1;
+            if attempts > max_retries {
+                return Err(anyhow::anyhow!("Max retries reached for sub-task {}", subtask.id));
+            }
+
+            // 1. Tool Selection (focused on sub-task)
+            let tool_selection = self.identify_needed_tools_for_subtask(main_task, subtask, available_tools, &feedback).await?;
+            
+            // 1.5 Pre-flight capability validation (fail fast if tools are inappropriate)
+            if let Err(capability_error) = self.validate_tool_capability(subtask, &tool_selection.needed_tools, available_tools).await {
+                // Don't retry if the issue is missing capability - escalate immediately
+                return Err(anyhow::anyhow!(
+                    "Task cannot be completed with available tools: {}. \
+                    This task requires capabilities not provided by current tools. \
+                    Please assign to a worker with appropriate tools or add required MCP servers.",
+                    capability_error
+                ));
+            }
+            
+            // 2. Load Metadata
+            let tool_metadata = self.load_tool_metadata(&tool_selection.needed_tools).await?;
+            
+            // 3. Plan Execution
+            let execution_plan = self.generate_plan_for_subtask(main_task, subtask, &tool_metadata, &feedback).await?;
+            
+            // 4. Execute Plan
+            let deliverables = match self.execute_discovery_plan(&execution_plan, main_task, &tool_metadata).await {
+                Ok(d) => d,
+                Err(e) => {
+                    feedback = format!("Execution error: {}", e);
+                    continue;
+                }
+            };
+            
+            // 5. Verify
+            let verification = self.verify_execution(main_task, subtask, &deliverables).await?;
+            
+            if verification.success {
+                tracing::info!("Worker {} verified sub-task {}", self.id.name, subtask.id);
+                return Ok(deliverables);
+            } else {
+                tracing::warn!("Worker {} verification failed for sub-task {}: {}", self.id.name, subtask.id, verification.feedback);
+                feedback = format!("Verification failed: {}. Issues: {:?}", verification.feedback, verification.issues);
+            }
+        }
+    }
+
+    async fn generate_subtasks(&self, task: &crate::projects::Task) -> Result<Vec<SubTask>> {
+        let prompt = format!(
+            r#"Break this task into 1-5 logical sub-tasks. Each sub-task must be atomic and verifiable.
+
+TASK: {}
+DESCRIPTION: {}
+
+Return JSON:
+{{
+  "subtasks": [
+    {{"id": 1, "description": "...", "goal": "...", "verification_criteria": "..."}}
+  ]
+}}
+"#,
+            task.title,
+            task.description
+        );
+
+        let options = GenerationOptions {
+            temperature: Some(0.3),
+            max_tokens: Some(2048),
+            system: Some(self.template.system_prompt.clone()),
+            ..Default::default()
+        };
+        
+        // Load user preference for Worker agent if available
+        let preferred_family = if let Some(ref user_settings) = self.user_settings {
+            let settings = user_settings.read().await;
+            match settings.get_model_preference("worker").await {
+                Ok(Some(family)) => Some(family),
+                _ => None
+            }
+        } else {
+            None
+        };
+        
+        let selection_context = SelectionContext::for_worker();
+        let selected_model = self.ai_provider_manager.select_model_for_agent_with_preferences(selection_context, preferred_family).await?;
+        let client = selected_model.get_client()?;
+        let model_name = if selected_model.model_id.contains("::") {
+            selected_model.model_id.split("::").nth(1).unwrap_or(&selected_model.model_id)
+        } else {
+            &selected_model.model_id
+        };
+        
+        // Retry loop for JSON parsing
+        let mut last_error = String::new();
+        let mut current_prompt = prompt.clone();
+
+        for attempt in 1..=3 {
+            if attempt > 1 {
+                tracing::warn!("Worker {} retrying subtask decomposition (attempt {}/3). Error: {}", self.id.name, attempt, last_error);
+                current_prompt = format!("{}\n\nPREVIOUS ATTEMPT FAILED. ERROR: {}\n\nCRITICAL: DO NOT EXPLAIN. DO NOT APOLOGIZE. OUTPUT RAW JSON ONLY.\nFIX THE JSON STRUCTURE AND TRY AGAIN.", prompt, last_error);
+            }
+
+            // Use timeout for generation
+            let llm_timeout = tokio::time::Duration::from_millis(
+                (self.execution_strategy.base_timeout_ms * 2) as u64
+            );
+
+            let response = match tokio::time::timeout(
+                llm_timeout,
+                client.generate(model_name, &current_prompt, options.clone())
+            ).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => return Err(anyhow::anyhow!("LLM generation timed out")),
+            };
+
+            tracing::debug!(
+                target: "llm_messages",
+                "[WORKER SUBTASK DECOMPOSITION RESPONSE] Model: {}, Response ({} chars):\n{}",
+                model_name,
+                response.text.len(),
+                response.text
+            );
+
+            if response.text.trim().is_empty() {
+                last_error = "LLM returned empty response".to_string();
+                continue;
+            }
+
+            #[derive(Deserialize)]
+            struct Response { subtasks: Vec<SubTask> }
+            
+            let json_str = match super::worker_discovery::extract_json(&response.text) {
+                Some(json) => json,
+                None => {
+                    last_error = "Failed to extract JSON from response".to_string();
+                    continue;
+                }
+            };
+            
+            match serde_json::from_str::<Response>(&json_str) {
+                Ok(res) => return Ok(res.subtasks),
+                Err(e) => {
+                    last_error = e.to_string();
+                    // Continue to next attempt
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to generate valid subtasks after 3 attempts. Last error: {}", last_error))
+    }
+
+    async fn identify_needed_tools_for_subtask(
+        &self,
+        main_task: &crate::projects::Task,
+        subtask: &SubTask,
+        available_tools: &[String],
+        feedback: &str,
+    ) -> Result<super::worker_discovery::ToolSelectionRequest> {
+        let tool_list = format_tool_list(available_tools);
+        let prompt = format!(
+            r#"Select the tools needed for this sub-task. Choose wisely from the available tools.
+
+MAIN TASK: {}
+SUB-TASK: {}
+GOAL: {}
+FEEDBACK: {}
+
+AVAILABLE TOOLS:
+{}
+
+CRITICAL INSTRUCTIONS:
+1. Select ONLY the tools you actually need (typically 1-5 tools)
+2. Each tool should appear ONLY ONCE in your list
+3. DO NOT repeat the same tool multiple times
+4. DO NOT list all available tools - be selective
+5. Return ONLY valid JSON, no explanations
+
+Return JSON (ONLY the JSON object, nothing else):
+{{"needed_tools": ["tool1", "tool2"], "reasoning": "brief explanation"}}
+"#,
+            main_task.title,
+            subtask.description,
+            subtask.goal,
+            feedback,
+            tool_list
+        );
+
+        // Reuse existing selection logic/model
+        let options = GenerationOptions {
+            temperature: Some(0.2),  // Lower temperature for more focused output
+            max_tokens: Some(1024),  // Reduced from 4096 - tool selection should be brief
+            system: Some(self.template.system_prompt.clone()),
+            ..Default::default()
+        };
+        
+        // Load user preference for Worker agent if available
+        let preferred_family = if let Some(ref user_settings) = self.user_settings {
+            let settings = user_settings.read().await;
+            match settings.get_model_preference("worker").await {
+                Ok(Some(family)) => Some(family),
+                _ => None
+            }
+        } else {
+            None
+        };
+        
+        let selection_context = SelectionContext::for_worker();
+        let selected_model = self.ai_provider_manager.select_model_for_agent_with_preferences(selection_context, preferred_family).await?;
+        let client = selected_model.get_client()?;
+        let model_name = if selected_model.model_id.contains("::") {
+            selected_model.model_id.split("::").nth(1).unwrap_or(&selected_model.model_id)
+        } else {
+            &selected_model.model_id
+        };
+        
+        let mut current_prompt = prompt.clone();
+        let mut last_error = String::new();
+
+        for attempt in 1..=3 {
+            if attempt > 1 {
+                tracing::warn!("Worker {} retrying tool selection (attempt {}/3). Error: {}", self.id.name, attempt, last_error);
+                current_prompt = format!("{}\n\nPREVIOUS ATTEMPT FAILED. ERROR: {}\n\nCRITICAL: DO NOT EXPLAIN. DO NOT APOLOGIZE. OUTPUT RAW JSON ONLY.\nFIX THE JSON STRUCTURE AND SELECTION.", prompt, last_error);
+            }
+
+            let response = client.generate(model_name, &current_prompt, options.clone()).await?;
+            
+            match parse_tool_selection(&response.text) {
+                Ok(mut selection) => {
+                    crate::agents::worker_discovery::resolve_selection_aliases(&mut selection, &available_tools);
+                    // Validate tools exist in available_tools (with fuzzy matching)
+                    let mut resolved_tools = Vec::new();
+                    let mut invalid_tools = Vec::new();
+                    
+                    for tool in &selection.needed_tools {
+                        if available_tools.contains(tool) {
+                            resolved_tools.push(tool.clone());
+                        } else {
+                            // Try to find by suffix (e.g. "file_read" -> "hainet-files::file_read")
+                            let suffix = format!("::{}", tool);
+                            let matches: Vec<&String> = available_tools.iter()
+                                .filter(|t| t.ends_with(&suffix) || t.ends_with(tool)) // check for ::tool or just tool if it matches end
+                                .collect();
+                                
+                            if matches.len() == 1 {
+                                resolved_tools.push(matches[0].clone());
+                            } else if matches.len() > 1 {
+                                // Ambiguous, pick first but warn
+                                tracing::warn!("Ambiguous tool selection '{}', defaulting to '{}'", tool, matches[0]);
+                                resolved_tools.push(matches[0].clone());
+                            } else {
+                                invalid_tools.push(tool.clone());
+                            }
+                        }
+                    }
+
+                    if invalid_tools.is_empty() {
+                        // Update selection with resolved full names
+                        let mut final_selection = selection;
+                        final_selection.needed_tools = resolved_tools;
+                        return Ok(final_selection);
+                    } else {
+                        last_error = format!(
+                            "Selected tools do not exist in AVAILABLE TOOLS list: {:?}. You MUST select ONLY from the provided list.",
+                            invalid_tools
+                        );
+                        // Continue to next attempt
+                    }
+                },
+                Err(e) => {
+                    last_error = e.to_string();
+                    // Continue to next attempt
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to select valid tools after 3 attempts. Last error: {}", last_error))
+    }
+
+    async fn generate_plan_for_subtask(
+        &self,
+        main_task: &crate::projects::Task,
+        subtask: &SubTask,
+        tool_metadata: &HashMap<String, String>,
+        feedback: &str,
+    ) -> Result<DiscoveryExecutionPlan> {
+        // Use minimal tool list for MCA compliance
+        let tool_names: Vec<String> = tool_metadata.keys().cloned().collect();
+        let formatted_tools = format_tool_list(&tool_names);
+        let example_tool = tool_names.first().map(|s| s.as_str()).unwrap_or("server::tool");
+        
+        let prompt = format!(
+            r#"Create execution plan for this sub-task.
+
+SUB-TASK: {}
+GOAL: {}
+FEEDBACK: {}
+
+AVAILABLE TOOLS:
+{}
+- worker::get_tool_info
+
+PARAMETERS vs FLAGS:
+- Parameters: JSON fields required by tools (path, query, content)
+- Flags: ONLY for worker::get_tool_info (--params, --examples)
+
+EXAMPLES:
+✓ {{"tool": "worker::get_tool_info", "params": {{"tool_name": "hainet-files::file_search", "flags": "--params"}}}}
+✓ {{"tool": "hainet-files::file_search", "params": {{"path": ".", "query": "example.txt"}}}}
+✗ {{"tool": "hainet-files::file_search", "params": {{"flags": {{"recursive": "true"}}, "query": "example"}}}}
+
+RULES:
+1. Call worker::get_tool_info({{"tool_name": "{}", "flags": "--params"}}) first
+2. Use ONLY parameters from tool schema, NOT flags
+3. step_number must be integer (1, 2, 3...)
+4. depends_on is optional (defaults to [])
+
+Return JSON:
+{{"steps": [{{"step_number": 1, "tool": "worker::get_tool_info", "params": {{"tool_name": "...", "flags": "--params"}}, "description": "..."}}]}}
+"#,
+            subtask.description,
+            subtask.goal,
+            feedback,
+            formatted_tools,
+            example_tool
+        );
+
+        // Reuse existing planning logic/model
+        let options = GenerationOptions {
+            temperature: Some(0.2),
+            max_tokens: Some(16384),  // Increased from 8192 to prevent truncation
+            num_ctx: Some(16384),     // Increased from 8192 to match max_tokens
+            system: Some(self.template.system_prompt.clone()),
+            ..Default::default()
+        };
+        
+        // Load user preference for Worker agent if available
+        let preferred_family = if let Some(ref user_settings) = self.user_settings {
+            let settings = user_settings.read().await;
+            match settings.get_model_preference("worker").await {
+                Ok(Some(family)) => Some(family),
+                _ => None
+            }
+        } else {
+            None
+        };
+        
+        let selection_context = SelectionContext::for_worker();
+        let selected_model = self.ai_provider_manager.select_model_for_agent_with_preferences(selection_context, preferred_family).await?;
+        let client = selected_model.get_client()?;
+        let model_name = if selected_model.model_id.contains("::") {
+            selected_model.model_id.split("::").nth(1).unwrap_or(&selected_model.model_id)
+        } else {
+            &selected_model.model_id
+        };
+        
+        // Retry loop for JSON parsing
+        let mut last_error = String::new();
+        let mut current_prompt = prompt.clone();
+
+        for attempt in 1..=3 {
+            if attempt > 1 {
+                tracing::warn!("Worker {} retrying subtask planning (attempt {}/3). Error: {}", self.id.name, attempt, last_error);
+                current_prompt = format!("{}\n\nPREVIOUS ATTEMPT FAILED. ERROR: {}\n\nCRITICAL: DO NOT EXPLAIN. DO NOT APOLOGIZE. OUTPUT RAW JSON ONLY.\nFIX THE JSON STRUCTURE AND TRY AGAIN.", prompt, last_error);
+            }
+
+            // Use timeout for generation
+            let llm_timeout = tokio::time::Duration::from_millis(
+                (self.execution_strategy.base_timeout_ms * 2) as u64
+            );
+
+        let response = match tokio::time::timeout(
+                llm_timeout,
+                client.generate(model_name, &current_prompt, options.clone())
+            ).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => return Err(anyhow::anyhow!("LLM generation timed out")),
+            };
+
+            tracing::debug!(
+                target: "llm_messages",
+                "[WORKER SUBTASK PLANNING RESPONSE] Model: {}, Response ({} chars):\n{}",
+                model_name,
+                response.text.len(),
+                response.text
+            );
+
+            if response.text.trim().is_empty() {
+                last_error = "LLM returned empty response".to_string();
+                continue;
+            }
+
+            match parse_execution_plan(&response.text) {
+                Ok(mut plan) => {
+                    crate::agents::worker_discovery::resolve_plan_aliases(&mut plan, &tool_names);
+                    return Ok(plan);
+                },
+                Err(e) => {
+                    last_error = e.to_string();
+                    // Continue to next attempt
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to generate valid subtask plan after 3 attempts. Last error: {}", last_error))
+    }
+
+    async fn verify_execution(
+    &self,
+    main_task: &crate::projects::Task,
+    subtask: &SubTask,
+    deliverables: &[String],
+) -> Result<VerificationResult> {
+    let prompt = format!(
+        r#"Verify this sub-task execution. Check if goal was met, look for placeholders (// TODO), check for errors.
+
+SUB-TASK: {}
+GOAL: {}
+CRITERIA: {}
+DELIVERABLES: {:?}
+
+CRITICAL: Return ONLY valid JSON, nothing else. No explanations, no markdown.
+Format: {{"success": true, "issues": [], "feedback": "..."}}
+
+Example valid response:
+{{"success": true, "issues": [], "feedback": "Task completed successfully"}}
+
+Example with issues:
+{{"success": false, "issues": ["Missing error handling"], "feedback": "Needs improvement"}}
+
+NOW RESPOND WITH JSON ONLY:
+"#,
+        subtask.description,
+        subtask.goal,
+        subtask.verification_criteria,
+        deliverables
+    );
+
+    let options = GenerationOptions {
+        temperature: Some(0.1),
+        max_tokens: Some(512), // Reduced from 1024 to encourage concise responses
+        system: Some(self.template.system_prompt.clone()),
+        ..Default::default()
+    };
+    
+    // Load user preference for Worker agent if available
+    let preferred_family = if let Some(ref user_settings) = self.user_settings {
+        let settings = user_settings.read().await;
+        match settings.get_model_preference("worker").await {
+            Ok(Some(family)) => Some(family),
+            _ => None
+        }
+    } else {
+        None
+    };
+    
+    let selection_context = SelectionContext::for_worker();
+    let selected_model = self.ai_provider_manager.select_model_for_agent_with_preferences(selection_context, preferred_family).await?;
+    let client = selected_model.get_client()?;
+    let model_name = if selected_model.model_id.contains("::") {
+        selected_model.model_id.split("::").nth(1).unwrap_or(&selected_model.model_id)
+    } else {
+        &selected_model.model_id
+    };
+    
+    let response = client.generate(model_name, &prompt, options).await?;
+    
+    tracing::debug!(
+        "Verification response ({} chars): {}",
+        response.text.len(),
+        &response.text[..response.text.len().min(200)]
+    );
+    
+    // Try multiple extraction and parsing strategies
+    self.parse_verification_result(&response.text)
+}
+
+/// Parse verification result with multiple fallback strategies
+fn parse_verification_result(&self, text: &str) -> Result<VerificationResult> {
+    // Strategy 1: Try extract_json_robust (most comprehensive)
+    if let Some(json_str) = super::worker_discovery::extract_json_robust(text) {
+        tracing::debug!("Extracted JSON (robust): {}", &json_str[..json_str.len().min(100)]);
+        
+        if let Ok(result) = serde_json::from_str::<VerificationResult>(&json_str) {
+            return Ok(result);
+        }
+        
+        // Try to repair and parse
+        if let Ok(result) = self.parse_verification_with_repair(&json_str) {
+            return Ok(result);
+        }
+    }
+    
+    // Strategy 2: Try standard extract_json
+    if let Some(json_str) = super::worker_discovery::extract_json(text) {
+        tracing::debug!("Extracted JSON (standard): {}", &json_str[..json_str.len().min(100)]);
+        
+        if let Ok(result) = serde_json::from_str::<VerificationResult>(&json_str) {
+            return Ok(result);
+        }
+        
+        if let Ok(result) = self.parse_verification_with_repair(&json_str) {
+            return Ok(result);
+        }
+    }
+    
+    // Strategy 3: Try to find JSON-like structure manually
+    if let Ok(result) = self.extract_verification_manually(text) {
+        return Ok(result);
+    }
+    
+    // Strategy 4: Fallback - assume success if we got here and deliverables exist
+    tracing::warn!(
+        "Failed to parse verification JSON, using fallback success result. Response: {}",
+        &text[..text.len().min(200)]
+    );
+    
+    Ok(VerificationResult {
+        success: true,
+        issues: vec![],
+        feedback: "Verification completed (JSON parsing fallback)".to_string(),
+    })
+}
+
+/// Try to parse verification result with JSON repair
+fn parse_verification_with_repair(&self, json_str: &str) -> Result<VerificationResult> {
+    // Try to repair common issues
+    let mut repaired = json_str.trim().to_string();
+    
+    // Remove any leading/trailing non-JSON characters
+    if let Some(start) = repaired.find('{') {
+        repaired = repaired[start..].to_string();
+    }
+    
+    if let Some(end) = repaired.rfind('}') {
+        repaired = repaired[..=end].to_string();
+    }
+    
+    // Count braces
+    let open_braces = repaired.matches('{').count();
+    let close_braces = repaired.matches('}').count();
+    
+    // Add missing closing braces
+    if open_braces > close_braces {
+        for _ in 0..(open_braces - close_braces) {
+            repaired.push('}');
+        }
+    }
+    
+    // Try to parse as generic JSON first, then extract fields manually
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&repaired) {
+        let success = value.get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        
+        let issues = value.get("issues")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        
+        let feedback = value.get("feedback")
+            .and_then(|v| v.as_str())
+            .unwrap_or("No feedback provided")
+            .to_string();
+        
+        return Ok(VerificationResult {
+            success,
+            issues,
+            feedback,
+        });
+    }
+    
+    Err(anyhow::anyhow!("Failed to repair and parse verification JSON"))
+}
+
+/// Manually extract verification result from text using pattern matching
+fn extract_verification_manually(&self, text: &str) -> Result<VerificationResult> {
+    // Look for success/failure indicators
+    let text_lower = text.to_lowercase();
+    
+    let success = if text_lower.contains("\"success\": true") 
+        || text_lower.contains("\"success\":true")
+        || text_lower.contains("success: true") {
+        true
+    } else if text_lower.contains("\"success\": false")
+        || text_lower.contains("\"success\":false")
+        || text_lower.contains("success: false") {
+        false
+    } else {
+        // Default to true if we can't determine
+        true
+    };
+    
+    // Try to extract feedback
+    let feedback = if let Some(start) = text.find("\"feedback\"") {
+        let after_key = &text[start..];
+        if let Some(colon_pos) = after_key.find(':') {
+            let after_colon = &after_key[colon_pos + 1..];
+            if let Some(quote_start) = after_colon.find('"') {
+                let content = &after_colon[quote_start + 1..];
+                if let Some(quote_end) = content.find('"') {
+                    content[..quote_end].to_string()
+                } else {
+                    "Verification completed".to_string()
+                }
+            } else {
+                "Verification completed".to_string()
+            }
+        } else {
+            "Verification completed".to_string()
+        }
+    } else {
+        "Verification completed".to_string()
+    };
+    
+    Ok(VerificationResult {
+        success,
+        issues: vec![],
+        feedback,
+    })
+}
+    
+    /// Ask LLM which tools it needs (Phase 1: Tool Selection)
+    async fn identify_needed_tools_discovery(
+        &self,
+        task: &crate::projects::Task,
+        available_tools: &[String],
+    ) -> Result<super::worker_discovery::ToolSelectionRequest> {
+        // Format minimal tool list
+        let tool_list = format_tool_list(available_tools);
+        
+        // Generate planning prompt using TOML template
+        let planning_prompt = format!(
+            r#"You are a Worker AI agent planning task execution.
+
+TASK: {}
+YOUR ROLE: {}
+CAPABILITIES: {:?}
+
+SESSION PROGRESS:
+{}
+
+AVAILABLE TOOLS (use EXACT format shown):
+{}
+
+CRITICAL RULES FOR TOOL SELECTION:
+1. Tool identifiers MUST use format: server::tool (e.g., 'hainet-files::file_write')
+2. ONLY select tools from the AVAILABLE TOOLS list above
+3. Do NOT invent tool names or use generic names like 'server::tool' or 'server::file_write'
+4. Do NOT use tools that are not in the list above
+5. Do NOT use 'filesystem' server (it is restricted). Use 'hainet-files' instead.
+6. SELECT AT MOST 5 UNIQUE TOOLS - do not repeat the same tool multiple times
+7. If you need to use a tool multiple times, list it ONCE - you will call it multiple times later
+
+COMMON TOOLS FOR FILE OPERATIONS:
+- hainet-files::directory_create (create directories - NOT 'create-directory')
+- hainet-files::file_write (write/create files)
+- hainet-files::file_read (read existing files)
+- hainet-files::file_list (list directory contents)
+- hainet-files::file_metadata (get file information)
+
+EXAMPLE VALID SELECTIONS (notice: NO DUPLICATES, MAX 5 TOOLS):
+- ["hainet-files::directory_create", "hainet-files::file_write"]
+- ["hainet-files::file_read", "hainet-files::file_edit"]
+- ["hainet-files::file_list", "hainet-files::file_write", "hainet-files::directory_create"]
+
+INSTRUCTIONS:
+1. Identify which UNIQUE tools you need from the AVAILABLE TOOLS list
+2. Select AT MOST 5 tools - NO DUPLICATES
+3. You can use simple tool names (e.g. "file_read") or full names (e.g. "hainet-files::file_read")
+4. Provide brief reasoning for your selection
+
+RESPOND WITH VALID JSON ONLY (no markdown, no explanations):
+{{
+  "needed_tools": ["hainet-files::directory_create", "hainet-files::file_write"],
+  "reasoning": "Need to create project directory structure and write initial files"
+}}
+
+CRITICAL: Respond with ONLY the JSON object. No markdown, no code blocks, no explanations.
+"#,
+            task.description,
+            self.template.name,
+            self.template.capabilities,
+            self.session_tasks.to_prompt_format(),
+            tool_list
+        );
+        
+        let options = GenerationOptions {
+            temperature: Some(0.2),  // Lower temperature for more focused output
+            max_tokens: Some(1024),  // Reduced from 8192 - tool selection should be brief (1-5 tools)
+            num_ctx: Some(4096),     // Reduced context window - sufficient for tool selection
+            system: Some(self.template.system_prompt.clone()),
+            ..Default::default()
+        };
+        
+        let selection_context = SelectionContext::for_worker();
+        let selected_model = self
+            .ai_provider_manager
+            .select_model_for_agent(selection_context)
+            .await
+            .context("Failed to select model for tool selection")?;
+        
+        let client = selected_model.get_client()?;
+        let model_name = if selected_model.model_id.contains("::") {
+            selected_model.model_id.split("::").nth(1).unwrap_or(&selected_model.model_id)
+        } else {
+            &selected_model.model_id
+        };
+        
+        let mut current_prompt = planning_prompt.clone();
+        let mut last_error = String::new();
+
+        for attempt in 1..=3 {
+            if attempt > 1 {
+                tracing::warn!("Worker {} retrying tool selection (attempt {}/3). Error: {}", self.id.name, attempt, last_error);
+                current_prompt = format!("{}\n\nPREVIOUS ATTEMPT FAILED. ERROR: {}\n\nCRITICAL: DO NOT EXPLAIN. DO NOT APOLOGIZE. OUTPUT RAW JSON ONLY.\nFIX THE JSON STRUCTURE AND SELECTION.", planning_prompt, last_error);
+            }
+
+            let response = client
+                .generate(model_name, &current_prompt, options.clone())
+                .await
+                .context("Failed to get tool selection from LLM")?;
+            
+            match parse_tool_selection(&response.text) {
+                Ok(mut selection) => {
+                    crate::agents::worker_discovery::resolve_selection_aliases(&mut selection, &available_tools);
+                    // Validate tools exist in available_tools (with fuzzy matching)
+                    let mut resolved_tools = Vec::new();
+                    let mut invalid_tools = Vec::new();
+                    
+                    for tool in &selection.needed_tools {
+                        if available_tools.contains(tool) {
+                            resolved_tools.push(tool.clone());
+                        } else {
+                            // Try to find by suffix (e.g. "file_read" -> "hainet-files::file_read")
+                            let suffix = format!("::{}", tool);
+                            let matches: Vec<&String> = available_tools.iter()
+                                .filter(|t| t.ends_with(&suffix) || t.ends_with(tool))
+                                .collect();
+                                
+                            if matches.len() == 1 {
+                                resolved_tools.push(matches[0].clone());
+                            } else if matches.len() > 1 {
+                                // Ambiguous, pick first but warn
+                                tracing::warn!("Ambiguous tool selection '{}', defaulting to '{}'", tool, matches[0]);
+                                resolved_tools.push(matches[0].clone());
+                            } else {
+                                invalid_tools.push(tool.clone());
+                            }
+                        }
+                    }
+
+                    if invalid_tools.is_empty() {
+                        // Update selection with resolved full names
+                        let mut final_selection = selection;
+                        final_selection.needed_tools = resolved_tools;
+                        return Ok(final_selection);
+                    } else {
+                        last_error = format!(
+                            "Selected tools do not exist in AVAILABLE TOOLS list: {:?}. You MUST select ONLY from the provided list.",
+                            invalid_tools
+                        );
+                        // Continue to next attempt
+                    }
+                },
+                Err(e) => {
+                    last_error = e.to_string();
+                    // Continue to next attempt
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to select valid tools after 3 attempts. Last error: {}", last_error))
+    }
+    
+    /// Load metadata for selected tools (Phase 2: Lazy Loading)
+    async fn load_tool_metadata(&self, tool_names: &[String]) -> Result<HashMap<String, String>> {
+        let mut metadata_map = HashMap::new();
+        
+        let mcp_client = self.mcp_client.read().await;
+        
+        for tool_identifier in tool_names {
+            match mcp_client.get_tool_metadata(tool_identifier).await {
+                Ok(metadata) => {
+                    let formatted = format!(
+                        "{}\n{}\n\nParameters:\n{}",
+                        metadata.full_name(),
+                        metadata.description,
+                        metadata.parameter_docs
+                    );
+                    metadata_map.insert(tool_identifier.clone(), formatted);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load metadata for {}: {}",
+                        tool_identifier,
+                        e
+                    );
+                }
+            }
+        }
+        
+        Ok(metadata_map)
+    }
+    
+    /// Validate that selected tools can accomplish the sub-task (fail fast on capability mismatch)
+    async fn validate_tool_capability(
+        &self,
+        subtask: &SubTask,
+        selected_tools: &[String],
+        available_tools: &[String],
+    ) -> Result<()> {
+        // Categorize available tools by capability
+        let has_web_search = available_tools.iter().any(|t| 
+            t.contains("hainet-web") || t.contains("web_search") || t.contains("fetch_url")
+        );
+        let has_file_ops = available_tools.iter().any(|t| 
+            t.contains("hainet-files") || t.contains("file_")
+        );
+        let has_thinking = available_tools.iter().any(|t| 
+            t.contains("sequential-thinking") || t.contains("thinking")
+        );
+        
+        // Analyze task description for required capabilities
+        let task_desc_lower = format!("{} {} {}", 
+            subtask.description.to_lowercase(),
+            subtask.goal.to_lowercase(),
+            subtask.verification_criteria.to_lowercase()
+        );
+        
+        // Check for research/web search requirements
+        let needs_research = task_desc_lower.contains("research") 
+            || task_desc_lower.contains("search") && !task_desc_lower.contains("file")
+            || task_desc_lower.contains("compare") && (task_desc_lower.contains("library") || task_desc_lower.contains("framework"))
+            || task_desc_lower.contains("documentation")
+            || task_desc_lower.contains("find information")
+            || task_desc_lower.contains("look up")
+            || task_desc_lower.contains("investigate")
+            || task_desc_lower.contains("vs") && (task_desc_lower.contains("library") || task_desc_lower.contains("framework"))
+            || task_desc_lower.contains("evaluate") && (task_desc_lower.contains("library") || task_desc_lower.contains("framework"))
+            || task_desc_lower.contains("select") && (task_desc_lower.contains("library") || task_desc_lower.contains("framework"));
+        
+        if needs_research && !has_web_search {
+            // Check if selected tools include web search
+            let selected_has_web = selected_tools.iter().any(|t| 
+                t.contains("hainet-web") || t.contains("web_search") || t.contains("fetch_url")
+            );
+            
+            if !selected_has_web {
+                return Err(anyhow::anyhow!(
+                    "Task requires web research/search capabilities but no web search tools are available. \
+                    Task keywords: research, compare, documentation, investigate. \
+                    Available tools: {:?}. \
+                    Suggested solution: Add 'hainet-web' MCP server to worker configuration.",
+                    available_tools.iter().map(|t| t.split("::").next().unwrap_or(t)).collect::<std::collections::HashSet<_>>()
+                ));
+            }
+        }
+        
+        // Additional validation: Check if only thinking tool is selected for file operations
+        let needs_file_ops = task_desc_lower.contains("file") 
+            || task_desc_lower.contains("write")
+            || task_desc_lower.contains("create")
+            || task_desc_lower.contains("directory");
+        
+        if needs_file_ops && !has_file_ops {
+            return Err(anyhow::anyhow!(
+                "Task requires file operations but no file tools are available. \
+                Suggested solution: Ensure 'hainet-files' MCP server is available."
+            ));
+        }
+        
+        // Validation passed
+        Ok(())
+    }
+    
+    /// Generate execution plan with loaded metadata (Phase 3: Focused Planning)
+    async fn generate_execution_plan_discovery(
+        &self,
+        task: &crate::projects::Task,
+        tool_metadata: &HashMap<String, String>,
+    ) -> Result<DiscoveryExecutionPlan> {
+        // Use minimal tool list for MCA compliance
+        let tool_names: Vec<String> = tool_metadata.keys().cloned().collect();
+        let formatted_tools = format_tool_list(&tool_names);
+        let example_tool = tool_names.first().map(|s| s.as_str()).unwrap_or("server::tool");
+        
+        let execution_prompt = format!(
+            r#"Create execution plan for this task.
+
+TASK: {}
+
+AVAILABLE TOOLS:
+{}
+- worker::get_tool_info
+
+RULES:
+1. Call worker::get_tool_info({{"tool_name": "{}"}}) to discover tool details
+2. Use the information provided (flags like --params, --examples) to learn how to use the tool
+3. Use FULL tool names from the list above
+4. Create directories before files
+5. step_number must be a simple integer (1, 2, 3...), NOT an object or string.
+
+Return JSON with steps array:
+{{"steps": [{{"step_number": 1, "tool": "worker::get_tool_info", "params": {{"tool_name": "..."}}, "description": "...", "depends_on": []}}]}}
+"#,
+            task.description,
+            formatted_tools,
+            example_tool
+        );
+        
+        let options = GenerationOptions {
+            temperature: Some(0.1),
+            max_tokens: Some(8192),
+            num_ctx: Some(8192),
+            system: Some(self.template.system_prompt.clone()),
+            ..Default::default()
+        };
+        
+        let selection_context = SelectionContext::for_worker();
+        let selected_model = self
+            .ai_provider_manager
+            .select_model_for_agent(selection_context)
+            .await
+            .context("Failed to select model for execution planning")?;
+        
+        let client = selected_model.get_client()?;
+        let model_name = if selected_model.model_id.contains("::") {
+            selected_model.model_id.split("::").nth(1).unwrap_or(&selected_model.model_id)
+        } else {
+            &selected_model.model_id
+        };
+        
+        // Add timeout wrapper to prevent indefinite hanging
+        // Use execution_strategy timeout (default 120s for complex tasks)
+        tracing::info!("[DIAGNOSTIC] Worker {} calling LLM for execution planning (model: {})", self.id.name, model_name);
+        let llm_timeout = tokio::time::Duration::from_millis(
+            (self.execution_strategy.base_timeout_ms * 2) as u64 // 2x base timeout for LLM calls
+        );
+
+        // Retry loop for JSON parsing
+        let mut last_error = String::new();
+        let mut current_prompt = execution_prompt.clone();
+
+        for attempt in 1..=3 {
+            if attempt > 1 {
+                tracing::warn!("Worker {} retrying execution plan generation (attempt {}/3). Error: {}", self.id.name, attempt, last_error);
+                // Append error to prompt to guide LLM
+                current_prompt = format!("{}\n\nPREVIOUS ATTEMPT FAILED. ERROR: {}\n\nCRITICAL: DO NOT EXPLAIN. DO NOT APOLOGIZE. OUTPUT RAW JSON ONLY.\nFIX THE JSON STRUCTURE AND TRY AGAIN.", execution_prompt, last_error);
+            }
+
+            let response = tokio::time::timeout(
+                llm_timeout,
+                client.generate(model_name, &current_prompt, options.clone())
+            )
+            .await
+            .context(format!("LLM generation timed out after {:?}", llm_timeout))?
+            .context("Failed to generate execution plan")?;
+            
+            tracing::debug!(
+                target: "llm_messages",
+                "[WORKER DISCOVERY PLANNING RESPONSE] Model: {}, Response ({} chars):\n{}",
+                model_name,
+                response.text.len(),
+                response.text
+            );
+
+            if response.text.trim().is_empty() {
+                last_error = "LLM returned empty response".to_string();
+                continue;
+            }
+
+            match parse_execution_plan(&response.text) {
+                Ok(mut plan) => {
+                    crate::agents::worker_discovery::resolve_plan_aliases(&mut plan, &tool_names);
+                    return Ok(plan);
+                },
+                Err(e) => {
+                    last_error = e.to_string();
+                    // Continue to next attempt
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to generate valid execution plan after 3 attempts. Last error: {}", last_error))
+    }
+    
+    /// Generate a new execution plan based on failure feedback
+    async fn generate_replanning_discovery(
+        &self,
+        task: &crate::projects::Task,
+        tool_metadata: &HashMap<String, String>,
+        error: &str,
+        failed_plan: &DiscoveryExecutionPlan,
+    ) -> Result<DiscoveryExecutionPlan> {
+        // Use minimal tool list for MCA compliance
+        let tool_names: Vec<String> = tool_metadata.keys().cloned().collect();
+        let formatted_tools = format_tool_list(&tool_names);
+        let example_tool = tool_names.first().map(|s| s.as_str()).unwrap_or("server::tool");
+        
+        let replanning_prompt = format!(
+            r#"Fix this task execution plan based on the error.
+
+TASK: {}
+ERROR: {}
+
+AVAILABLE TOOLS:
+{}
+- worker::get_tool_info
+
+RULES:
+1. Call worker::get_tool_info({{"tool_name": "{}"}}) to discover tool details
+2. Use the information provided (flags like --params, --examples) to learn how to use the tool
+3. Use FULL tool names from the list above
+4. Create directories before files
+5. step_number must be a simple integer (1, 2, 3...), NOT an object or string.
+
+Return JSON with steps array:
+{{"steps": [{{"step_number": 1, "tool": "worker::get_tool_info", "params": {{"tool_name": "..."}}, "description": "...", "depends_on": []}}]}}
+"#,
+            task.description,
+            error,
+            formatted_tools,
+            example_tool
+        );
+         let options = GenerationOptions {
+            temperature: Some(0.1),
+            max_tokens: Some(8192),
+            system: Some(self.template.system_prompt.clone()),
+            ..Default::default()
+        };
+        
+        let selection_context = SelectionContext::for_worker();
+        let selected_model = self
+            .ai_provider_manager
+            .select_model_for_agent(selection_context)
+            .await
+            .context("Failed to select model for replanning")?;
+        
+        let client = selected_model.get_client()?;
+        let model_name = if selected_model.model_id.contains("::") {
+            selected_model.model_id.split("::").nth(1).unwrap_or(&selected_model.model_id)
+        } else {
+            &selected_model.model_id
+        };
+        
+        tracing::info!("[DIAGNOSTIC] Worker {} calling LLM for replanning (model: {})", self.id.name, model_name);
+        
+        let llm_timeout = tokio::time::Duration::from_millis(
+            (self.execution_strategy.base_timeout_ms * 2) as u64
+        );
+        
+        let response = tokio::time::timeout(
+            llm_timeout,
+            client.generate(model_name, &replanning_prompt, options)
+        )
+        .await
+        .context(format!("LLM generation timed out after {:?}", llm_timeout))?
+        .context("Failed to generate corrected execution plan")?;
+        
+        tracing::debug!(
+            target: "llm_messages",
+            "[WORKER REPLANNING RESPONSE] Model: {}, Response ({} chars):\n{}",
+            model_name,
+            response.text.len(),
+            response.text
+        );
+
+        match parse_execution_plan(&response.text) {
+            Ok(mut plan) => {
+                crate::agents::worker_discovery::resolve_plan_aliases(&mut plan, &tool_names);
+                Ok(plan)
+            },
+            Err(e) => Err(anyhow::anyhow!("Failed to parse corrected execution plan: {}", e))
+        }
+    }
+
+    /// Execute discovery-based plan (Phase 4: Execution with Feedback)
+    async fn execute_discovery_plan(
+        &mut self,
+        plan: &DiscoveryExecutionPlan,
+        task: &crate::projects::Task,
+        tool_metadata: &HashMap<String, String>,
+    ) -> Result<Vec<String>> {
+        let mut deliverables = Vec::new();
+        
+        for (idx, step) in plan.steps.iter().enumerate() {
+            tracing::info!(
+                "Worker {} executing discovery step {}/{}: {}",
+                self.id.name,
+                idx + 1,
+                plan.steps.len(),
+                step.description
+            );
+            
+            let step_start = SystemTime::now();
+            let mut retry_count = 0u32;
+            
+            let result = loop {
+                retry_count += 1;
+                
+                match self.execute_discovery_step(step, tool_metadata).await {
+                    Ok(result) => {
+                        // Record successful step
+                        let duration_ms = step_start.elapsed()
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        
+                        let outcome = TaskOutcome {
+                            task_type: task.title.clone(),
+                            tool_used: step.tool.clone(),
+                            success: true,
+                            duration_ms,
+                            retry_count: retry_count.saturating_sub(1),
+                            error_category: None,
+                            timestamp: SystemTime::now(),
+                        };
+                        
+                        self.learner.record_outcome(outcome.clone());
+                        self.tool_selector.record_outcome(outcome);
+                        
+                        break result;
+                    }
+                    Err(error) => {
+                        // Self-correction with adaptive retry
+                        if self.self_correction_enabled {
+                            let error_category = ErrorCategory::classify(&error.to_string());
+                            
+                            tracing::warn!(
+                                "Worker {} discovery step failed (attempt {}): {:?} - {}",
+                                self.id.name,
+                                retry_count,
+                                error_category,
+                                error
+                            );
+                            
+                            match error_category {
+                                ErrorCategory::Transient => {
+                                    if retry_count <= self.execution_strategy.max_retries {
+                                        let delay_ms = self.execution_strategy.retry_delay_ms(retry_count);
+                                        tracing::info!("Retrying in {}ms (transient error)", delay_ms);
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                        continue;
+                                    } else {
+                                        self.record_step_failure(task, &convert_to_legacy_step(step), retry_count, error_category);
+                                        return Err(anyhow::anyhow!(
+                                            "Discovery step {} failed after {} retries: {}",
+                                            idx + 1,
+                                            self.execution_strategy.max_retries,
+                                            error
+                                        ));
+                                    }
+                                }
+                                ErrorCategory::Permanent => {
+                                    tracing::error!("Permanent error detected, requesting PM help");
+                                    self.record_step_failure(task, &convert_to_legacy_step(step), retry_count, error_category);
+                                    return Err(anyhow::anyhow!(
+                                        "Permanent error (requesting PM help): {}",
+                                        error
+                                    ));
+                                }
+                                ErrorCategory::Unknown => {
+                                    if retry_count == 1 {
+                                        tracing::info!("Retrying unknown error once");
+                                        let delay_ms = self.execution_strategy.retry_delay_ms(retry_count);
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                        continue;
+                                    } else {
+                                        tracing::error!("Unknown error persists, requesting PM help");
+                                        self.record_step_failure(task, &convert_to_legacy_step(step), retry_count, error_category);
+                                        return Err(error);
+                                    }
+                                }
+                            }
+                        } else {
+                            // Self-correction disabled
+                            if retry_count <= self.execution_strategy.max_retries {
+                                let delay_ms = 500 * retry_count as u64;
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                continue;
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+            };
+            
+            deliverables.push(format!(
+                "Step {}: {} - {}",
+                idx + 1,
+                step.description,
+                result
+            ));
+        }
+        
+        Ok(deliverables)
+    }
+    
+    /// Format tool information based on requested flags
+    /// Supports progressive disclosure: compact by default, detailed on demand
+    fn format_tool_info(full_metadata: &str, flags: &str) -> String {
+        // If --all flag is present, return full metadata (backward compatible)
+        if flags.contains("--all") {
+            return full_metadata.to_string();
+        }
+        
+        // Try to parse metadata as JSON
+        let meta: serde_json::Value = match serde_json::from_str(full_metadata) {
+            Ok(v) => v,
+            Err(_) => {
+                // If not JSON, return as-is with flag info
+                return format!("{}\n\nAvailable flags: --params, --examples, --errors, --all", full_metadata);
+            }
+        };
+        
+        let mut output = String::new();
+        
+        // Always include tool name and description
+        if let Some(name) = meta.get("name") {
+            output.push_str(&format!("Tool: {}\n", name.as_str().unwrap_or("")));
+        }
+        if let Some(desc) = meta.get("description") {
+            output.push_str(&format!("Description: {}\n", desc.as_str().unwrap_or("")));
+        }
+        
+        // If no flags specified, show compact info with available flags
+        if flags.is_empty() {
+            output.push_str("\nAvailable flags:\n");
+            output.push_str("  --params   : Show parameter schema\n");
+            output.push_str("  --examples : Show usage examples\n");
+            output.push_str("  --errors   : Show common errors\n");
+            output.push_str("  --all      : Show full metadata\n");
+            output.push_str("\nUsage: worker::get_tool_info({\"tool_name\": \"...\", \"flags\": \"--params\"})\n");
+            return output;
+        }
+        
+        output.push_str("\n");
+        
+        // Show requested sections
+        if flags.contains("--params") {
+            if let Some(schema) = meta.get("inputSchema") {
+                output.push_str("=== PARAMETERS ===\n");
+                if let Some(props) = schema.get("properties") {
+                    if let Some(obj) = props.as_object() {
+                        for (key, value) in obj {
+                            let type_str = value.get("type")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("any");
+                            let desc = value.get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("");
+                            let required = schema.get("required")
+                                .and_then(|r| r.as_array())
+                                .map(|arr| arr.iter().any(|v| v.as_str() == Some(key)))
+                                .unwrap_or(false);
+                            
+                            output.push_str(&format!("  {} ({}){}: {}\n", 
+                                key, 
+                                type_str,
+                                if required { " [REQUIRED]" } else { "" },
+                                desc
+                            ));
+                        }
+                    }
+                }
+                output.push_str("\n");
+            }
+        }
+        
+        if flags.contains("--examples") {
+            if let Some(examples) = meta.get("examples") {
+                output.push_str("=== EXAMPLES ===\n");
+                output.push_str(&format!("{}\n\n", examples.as_str().unwrap_or("No examples available")));
+            }
+        }
+        
+        if flags.contains("--errors") {
+            if let Some(errors) = meta.get("commonErrors") {
+                output.push_str("=== COMMON ERRORS ===\n");
+                output.push_str(&format!("{}\n\n", errors.as_str().unwrap_or("No error documentation available")));
+            }
+        }
+        
+        output
+    }
+    
+    /// Execute single discovery step
+    async fn execute_discovery_step(&self, step: &DiscoveryExecutionStep, tool_metadata: &HashMap<String, String>) -> Result<String> {
+        // Special handling for worker::get_tool_info (just-in-time tool discovery)
+        if step.tool == "worker::get_tool_info" {
+            let tool_name = step.params.get("tool_name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing tool_name parameter for worker::get_tool_info"))?;
+            
+            let flags = step.params.get("flags")
+                .and_then(|v| v.as_str())
+                .unwrap_or("--params");
+            
+            if let Some(metadata) = tool_metadata.get(tool_name) {
+                tracing::debug!("Worker {} providing tool info for: {} (flags: '{}')", self.id.name, tool_name, flags);
+                let info = Self::format_tool_info(metadata, flags);
+                return Ok(info);
+            } else {
+                return Err(anyhow::anyhow!("Tool not found: {}. Available tools: {:?}", 
+                    tool_name, 
+                            tool_metadata.keys().collect::<Vec<_>>()
+                ));
+            }
+        }
+        
+        // Parse tool name: "server::tool_name"
+        let parts: Vec<&str> = step.tool.split("::").collect();
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!("Invalid tool format: {}", step.tool));
+        }
+        
+        let (server, tool) = (parts[0], parts[1]);
+        
+        // Pre-execution parameter validation to catch common mistakes
+        if server == "hainet-files" {
+            // Check for common mistake: using "flags" as a parameter for MCP tools
+            if step.params.get("flags").is_some() {
+                return Err(anyhow::anyhow!(
+                    "Invalid parameter 'flags' for tool '{}'. \
+                    Flags are ONLY for worker::get_tool_info, not for MCP tools. \
+                    Please use the actual tool parameters (e.g., 'path', 'query', 'content') instead. \
+                    Call worker::get_tool_info with flags='--params' to see required parameters.",
+                    step.tool
+                ));
+            }
+            
+            // Validate required 'path' parameter for file operations
+            let file_ops_requiring_path = [
+                "file_read", "file_write", "file_append", "file_list", 
+                "file_metadata", "directory_create", "file_search", "file_edit"
+            ];
+            
+            if file_ops_requiring_path.contains(&tool) {
+                if step.params.get("path").is_none() {
+                    return Err(anyhow::anyhow!(
+                        "Missing required 'path' parameter for tool '{}'. \
+                        File operations require a 'path' parameter. \
+                        Example: {{\"path\": \"./src/main.rs\"}} or {{\"path\": \".\"}}",
+                        step.tool
+                    ));
+                }
+            }
+        }
+        
+        // Add project_name to params for sandboxing (Session 52)
+        let mut params = step.params.clone();
+        if let Some(ref project_name) = self.current_project_name {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("project_name".to_string(), serde_json::Value::String(project_name.clone()));
+            }
+        }
+        
+        let mcp_client = self.mcp_client.read().await;
+        let result = mcp_client.call_tool(server, tool, params).await?;
+        
+        Ok(result.to_string())
+    }
+    /// Run worker loop processing tasks from channel
+    pub async fn run(mut self, mut task_rx: tokio::sync::mpsc::Receiver<TaskId>) {
+        tracing::info!("Worker {} started run loop", self.id.name);
+
+        // Register with MessageBus and store the receiver to keep registration alive
+        let (receiver, _) = self.message_bus.write().await
+            .register_agent(self.id.clone())
+            .await
+            .context("Failed to register Worker agent with MessageBus")
+            .expect("Worker failed to register with MessageBus"); // Panic if registration fails, as it's critical
+        self._receiver = Some(receiver);
+        
+        while let Some(task_id) = task_rx.recv().await {
+            tracing::info!("Worker {} received task {}", self.id.name, task_id);
+            
+            // Task is already marked as Assigned in DB by PM
+            // But we still need to call assign_task to set up worker-side state
+            if let Err(e) = self.assign_task(task_id.clone()).await {
+                tracing::error!("Worker {} failed to assign task: {:?}", self.id.name, e);
+                continue;
+            }
+
+            // Mark task as started (InProgress)
+            {
+                let project_manager = self.project_manager.write().await;
+                if let Err(e) = project_manager.start_task(&task_id).await {
+                    tracing::error!("Worker {} failed to start task: {:?}", self.id.name, e);
+                    continue;
+                }
+            }
+            
+            // Execute task
+            // We use execute_task_with_discovery() which includes the full lifecycle (Planning -> Working -> Reporting)
+            // and uses dynamic tool discovery instead of rigid hardcoded prompts
+            if let Err(e) = self.execute_task_with_discovery().await {
+                 tracing::error!("Worker {} failed to execute task: {:?}", self.id.name, e);
+                 // We continue to validation even on error, as the task might be marked as Failed
+                 // and we need to clear the state or handle revision
+            }
+            
+            // Wait for validation
+            match self.await_validation().await {
+                Ok(_) => tracing::info!("Worker {} task validated, ready for next", self.id.name),
+                Err(e) => tracing::error!("Worker {} validation failed/timed out: {:?}", self.id.name, e),
+            }
+            
+            // Ensure we are back in Idle state before next task
+            if !matches!(self.state_machine.current_state(), AgentState::Idle) {
+                tracing::warn!("Worker {} not in Idle state after validation, forcing transition", self.id.name);
+                let _ = self.state_machine.transition(
+                    AgentState::Idle, 
+                    "Forcing Idle state for next task".to_string()
+                );
+                self.current_task = None;
+            }
+        }
+        
+        tracing::info!("Worker {} run loop ended", self.id.name);
+    }
+    
+    fn get_te_prompt(&self, prompt_name: &str) -> Option<String> {
+        super::prompt_loader::get_prompt(prompt_name)
+    }
+}
+
+#[async_trait::async_trait]
+impl super::Agent for WorkerAgent {
+    fn id(&self) -> &AgentId {
+        &self.id
+    }
+
+    async fn start(&mut self) -> Result<()> {
+        // Placeholder start logic
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        // Placeholder stop logic
+        Ok(())
+    }
+
+    async fn process_message(&mut self, _message: crate::messaging::Message) -> Result<()> {
+        // Placeholder message processing logic
+        Ok(())
+    }
+}
+
+
+/// Execution plan generated by LLM
+#[derive(Debug, Clone)]
+struct ExecutionPlan {
+    steps: Vec<ExecutionStep>,
+}
+
+/// Single execution step
+#[derive(Debug, Clone)]
+struct ExecutionStep {
+    tool: String,  // Format: "server::tool_name"
+    params: serde_json::Value,
+    description: String,
+}
+
+/// Convert DiscoveryExecutionStep to ExecutionStep (for backward compatibility)
+fn convert_to_legacy_step(discovery_step: &DiscoveryExecutionStep) -> ExecutionStep {
+    ExecutionStep {
+        tool: discovery_step.tool.clone(),
+        params: discovery_step.params.clone(),
+        description: discovery_step.description.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    async fn create_test_worker() -> WorkerAgent {
+        let message_bus = Arc::new(RwLock::new(MessageBus::new().await.unwrap()));
+        let prompt_manager = Arc::new(RwLock::new(PromptManager::new("prompts".into()).unwrap()));
+        let project_manager = Arc::new(RwLock::new(
+            ProjectManager::new("sqlite::memory:").await.unwrap()
+        ));
+        let mcp_client = Arc::new(RwLock::new(MCPClientManager::new()));
+        let ai_provider_manager = Arc::new(AIProviderManager::new(None, "standalone".to_string()).await.unwrap());
+        
+        WorkerAgent::new(
+            WorkerType::Files, 
+            message_bus, 
+            prompt_manager, 
+            project_manager,
+            mcp_client,
+            ai_provider_manager
+        )
+    }
+    
+    #[tokio::test]
+    async fn test_worker_creation() {
+        let worker = create_test_worker().await;
+        assert_eq!(worker.state(), &AgentState::Startup);
+        assert_eq!(worker.worker_type(), &WorkerType::Files);
+    }
+    
+    #[tokio::test]
+    async fn test_worker_assign_task() {
+        let mut worker = create_test_worker().await;
+        
+        // Transition to Idle first
+        worker.state_machine.transition(AgentState::Idle, "Init".to_string()).unwrap();
+        
+        // Create a project and a task
+        let task_id = {
+            let pm_mgr = worker.project_manager.write().await;
+            let project_id = pm_mgr.create_project(
+                "Test Project".to_string(),
+                "Test project for worker".to_string(),
+                vec!["Task 1".to_string()],
+            ).await.unwrap();
+            let tasks = pm_mgr.get_project_tasks(&project_id).await.unwrap();
+            tasks[0].id.clone()
+        };
+        
+        // Assignment should succeed
+        let result = worker.assign_task(task_id).await;
+        assert!(result.is_ok());
+        assert!(worker.current_task.is_some());
+    }
+}

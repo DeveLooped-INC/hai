@@ -1,0 +1,116 @@
+# START OF FILE hainet-core/Cargo.toml
+[package]
+name = "hainet-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "HAI-Net Core Daemon - Main networking and coordination service"
+
+[dependencies]
+x25519-dalek = { version = "2.0.0", features = ["static_secrets"] }
+chrono = "0.4"
+tracing-appender = "0.2"
+toml = "0.8"
+# Workspace dependencies
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+config = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+
+# Networking
+libp2p = { workspace = true, features = ["mdns", "tcp", "tokio", "ping", "noise", "yamux", "tls"] }
+libp2p-swarm-derive = { workspace = true }
+hyper = { workspace = true }
+
+# Phase 9A Session 4: Mesh Communication
+reqwest = { version = "0.11", features = ["json"] }
+serde_bytes = "0.11"
+tokio-socks = "0.5.1"
+
+# Storage
+sled = { workspace = true }
+blake3 = "1.5"
+hex = "0.4"
+
+# Crypto for identity
+ed25519-dalek = { workspace = true }
+sha3 = { workspace = true }
+
+# Multimodal (STT/TTS)
+base64 = "0.22"
+hound = "3.5"  # WAV processing
+dirs = "5.0"   # Home directory detection
+which = "6.0"  # Executable detection for Piper TTS
+
+# Vision (Webcam)
+image = "0.25"
+nokhwa = { version = "0.10.0", features = ["output-threaded"] }
+
+# Whisper integration via whisper-rs (bindings to whisper.cpp)
+# Note: whisper-rs compilation requires cmake and a C++ compiler
+# For now, we'll implement a simpler approach using external Whisper process
+# or wait for Candle ecosystem to stabilize
+# 
+# Alternative: Use whisper-rs when available
+# whisper-rs = "0.10"
+#
+# For Phase 2.2 completion, we'll keep the architecture in place
+# but use a placeholder that documents the integration path
+# Multi-format audio decoding (WebM/Opus, MP3, etc.)
+symphonia = "0.5"
+base32 = "0.5.1"
+
+[dev-dependencies]
+tempfile = "3.0"
+tokio-test = "0.4"
+
+[dependencies.hainet-persona]
+path = "../hainet-persona"
+
+# Integration: Compute sharing (from PPLPWR)
+[dependencies.hainet-collab]
+path = "../hainet-collab"
+
+# Integration: Social mesh (from gChat)
+[dependencies.hainet-social]
+path = "../hainet-social"
+
+# NoSlop Home HUB: the NoSlop 0.8 mesh protocol, creator hosting and the owner API
+[dependencies.hainet-noslop]
+path = "../hainet-noslop"
+features = ["hub"]
+
+[dependencies.sha2]
+version = "0.10"
+
+# Static file serving (portal consolidation — serve UI from core port)
+[dependencies.rust-embed]
+version = "8.0"
+features = ["include-exclude"]
+
+[dependencies.mime_guess]
+version = "2.0"
+
+[dependencies.sqlx]
+workspace = true
+features = ["runtime-tokio-rustls", "sqlite"]
+
+[dependencies.tiny_http]
+version = "0.12"
+
+[dependencies.sysinfo]
+workspace = true
+
+[[bin]]
+name = "hainet-core"
+path = "src/main.rs"

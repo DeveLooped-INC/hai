@@ -1,0 +1,26 @@
+# Ollama API Endpoints for HAI-Net Load Balancing
+#
+# This file configures the Ollama endpoints that the AIProviderManager will use
+# to distribute LLM requests. The default strategy is LeastLoaded, which sends
+# requests to the endpoint with the fewest active connections.
+
+[load_balancing]
+# Strategy for distributing requests across endpoints.
+# Options: "LeastLoaded", "RoundRobin", "ModelAffinity" (planned)
+strategy = "LeastLoaded"
+
+# Default request timeout in seconds.
+request_timeout_secs = 120
+
+# Interval for background health checks in seconds.
+health_check_interval_secs = 30
+
+# === Endpoints ===
+# Define one or more Ollama endpoints below.
+
+[endpoints.primary]
+# URL of the Ollama API endpoint.
+url = "http://localhost:11434"
+
+# Maximum number of concurrent requests for this endpoint.
+max_concurrent = 3
